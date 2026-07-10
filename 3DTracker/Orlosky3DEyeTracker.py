@@ -19,8 +19,9 @@ max_rays = 100  # Limit the number of stored pupil rays
 prev_model_center_avg = (320,240)  # Preserve the last valid eye center
 max_observed_distance = 0  # Initialize adaptive radius
 last_sphere_radius_ellipse = None  # Last pupil ellipse used to expand the eye sphere radius
+eye_sphere_adjustment_enabled = True  # Toggle automatic eye center/radius updates with F
 pupil_confidence_threshold = 0.85  # Minimum pupil confidence for storing a ray
-pupil_confidence_threshold_sphere = 0.60  # Minimum pupil confidence for determining eye sphere radius
+pupil_confidence_threshold_sphere = 0.65  # Minimum pupil confidence for determining eye sphere radius
 intersection_ray_count = 4  # Rays sampled for each intersection estimate
 minimum_intersection_angle_degrees = 8  # Minimum angle between sampled rays
 last_tracking_result = None  # Store the latest tracker output
@@ -193,6 +194,49 @@ def distance_to_pupil_outer_edge(eye_center, pupil_ellipse):
 
     return center_distance + edge_offset
 
+def update_eye_sphere_radius(eye_center, current_pupil_ellipse, current_pupil_confidence):
+    global max_observed_distance
+    global last_sphere_radius_ellipse
+
+    if last_sphere_radius_ellipse is not None:
+        anchored_distance = distance_to_pupil_outer_edge(
+            eye_center,
+            last_sphere_radius_ellipse,
+        )
+        if anchored_distance is not None:
+            max_observed_distance = anchored_distance
+
+    if (
+        current_pupil_ellipse is not None
+        and current_pupil_confidence >= pupil_confidence_threshold_sphere
+        and len(model_centers) >= min_model_centers
+    ):
+        current_distance = distance_to_pupil_outer_edge(
+            eye_center,
+            current_pupil_ellipse,
+        )
+        if (
+            current_distance is not None
+            and (
+                last_sphere_radius_ellipse is None
+                or current_distance > max_observed_distance
+            )
+        ):
+            max_observed_distance = current_distance
+            last_sphere_radius_ellipse = current_pupil_ellipse
+
+def get_eye_sphere_adjustment_prompt():
+    if eye_sphere_adjustment_enabled:
+        return "Press F to affix eyeball sphere"
+    return "Press F again to engage automatic eye sphere adjustment"
+
+def toggle_eye_sphere_adjustment():
+    global eye_sphere_adjustment_enabled
+
+    eye_sphere_adjustment_enabled = not eye_sphere_adjustment_enabled
+    state_text = "automatic" if eye_sphere_adjustment_enabled else "affixed"
+    print(f"Eye sphere adjustment: {state_text}")
+
 #checks how many pixels in the contour fall under a slightly thickened ellipse
 #also returns that number of pixels divided by the total pixels on the contour border
 #assists with checking ellipse goodness    
@@ -362,7 +406,10 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         ellipse = cv2.fitEllipse(final_contours[0])
         final_rotated_rect = ellipse
 
-        if best_ratio_under_ellipse >= pupil_confidence_threshold:
+        if (
+            eye_sphere_adjustment_enabled
+            and best_ratio_under_ellipse >= pupil_confidence_threshold
+        ):
             ray_lines.append(final_rotated_rect)
             if len(ray_lines) > max_rays:
                 num_to_remove = len(ray_lines) - max_rays
@@ -370,15 +417,16 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
 
     model_center_average = (320,240)
 
-    model_center = compute_average_intersection(
-        frame,
-        ray_lines,
-        intersection_ray_count,
-        1500,
-        minimum_intersection_angle_degrees,
-    )
-    if model_center is not None and model_center != (0, 0):
-        model_center_average = update_and_average_point(model_centers, model_center, 200)
+    if eye_sphere_adjustment_enabled:
+        model_center = compute_average_intersection(
+            frame,
+            ray_lines,
+            intersection_ray_count,
+            1500,
+            minimum_intersection_angle_degrees,
+        )
+        if model_center is not None and model_center != (0, 0):
+            model_center_average = update_and_average_point(model_centers, model_center, 200)
 
     if model_center_average[0] == 320:
         model_center_average = prev_model_center_avg
@@ -390,21 +438,12 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         last_tracking_result = None
         return  # or skip this frame
 
-    if (
-        final_rotated_rect is not None
-        and best_ratio_under_ellipse >= pupil_confidence_threshold_sphere
-        and len(model_centers) >= min_model_centers
-    ):
-        outer_edge_distance = distance_to_pupil_outer_edge(
+    if eye_sphere_adjustment_enabled:
+        update_eye_sphere_radius(
             model_center_average,
             final_rotated_rect,
+            best_ratio_under_ellipse,
         )
-        if (
-            outer_edge_distance is not None
-            and outer_edge_distance > max_observed_distance
-        ):
-            max_observed_distance = outer_edge_distance
-            last_sphere_radius_ellipse = final_rotated_rect
 
     last_tracking_result = {
         "pupil_ellipse": {
@@ -462,6 +501,12 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         gl_image = gl_sphere.update_sphere_rotation(center_x, center_y, model_center_average[0], model_center_average[1])
     #cv2.circle(frame, (center_x, center_y), 22, (255, 255, 0), -1)  # Draw intersection center
 
+    prompt_text = get_eye_sphere_adjustment_prompt()
+    prompt_shadow = (12, frame.shape[0] - 63)
+    prompt_origin = (10, frame.shape[0] - 65)
+    cv2.putText(frame, prompt_text, prompt_shadow, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+    cv2.putText(frame, prompt_text, prompt_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
     # Call the function
     center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
 
@@ -482,12 +527,6 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         cv2.putText(frame, origin_text, text_origin2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         cv2.putText(frame, dir_text, text_dir2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-    if center is not None and direction is not None:
-        print(f"Sphere Center:   ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})")
-        print(f"Gaze Direction:  ({direction[0]:.3f}, {direction[1]:.3f}, {direction[2]:.3f})")
-    else:
-        print("No valid intersection found.")
-
     ratio_text = f"{best_ratio_under_ellipse * 100:.2f}%"
     cv2.putText(frame, ratio_text, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
     cv2.putText(frame, ratio_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
@@ -507,6 +546,7 @@ def reset_tracking_state():
     global prev_model_center_avg
     global max_observed_distance
     global last_sphere_radius_ellipse
+    global eye_sphere_adjustment_enabled
     global stored_intersections
     global capture_frame_counter
     global stuck_ellipses
@@ -517,6 +557,7 @@ def reset_tracking_state():
     prev_model_center_avg = (320, 240)
     max_observed_distance = 0
     last_sphere_radius_ellipse = None
+    eye_sphere_adjustment_enabled = True
     stored_intersections = []
     capture_frame_counter = 0
     stuck_ellipses = []
@@ -810,7 +851,6 @@ def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_heigh
                 all_values = np.concatenate((sphere_center, gaze_rotated))
                 csv_line = ",".join(f"{v:.6f}" for v in all_values)
                 f.write(csv_line + "\n")
-                print("wrote to file")
         except Exception as e:
             print("Write error:", e)
     else:
@@ -865,6 +905,7 @@ def process_camera():
 
     cam_index = int(selected_camera.get())
 
+    reset_tracking_state()
     cap = cv2.VideoCapture(cam_index, cv2.CAP_MSMF)
 
     if not cap.isOpened():
@@ -886,6 +927,8 @@ def process_camera():
             break
         elif key == ord(' '):
             cv2.waitKey(0)
+        elif key in (ord('f'), ord('F')):
+            toggle_eye_sphere_adjustment()
         elif key == ord('e'):
             capture_stuck_ellipses = not capture_stuck_ellipses
             capture_frame_counter = 0
@@ -904,6 +947,7 @@ def process_video():
     if not video_path:
         return  # User canceled selection
 
+    reset_tracking_state()
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
@@ -922,6 +966,8 @@ def process_video():
             break
         elif key == ord(' '):
             cv2.waitKey(0)
+        elif key in (ord('f'), ord('F')):
+            toggle_eye_sphere_adjustment()
 
     cap.release()
     cv2.destroyAllWindows()
