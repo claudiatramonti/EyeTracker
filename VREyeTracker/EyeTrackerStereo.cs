@@ -5,10 +5,11 @@ using UnityEngine;
 
 public class EyeTracker : MonoBehaviour
 {
-    private const string GazeFilePath = @"C:\storage\gaze_vector.txt";
+    private const string GazeFilePath = @"C:\Storage\Google Drive\Software\EyeTracker3DPython\Orlosky3DEyeTracker\gaze_vector.txt";
     private const int LeftEye = 0;
     private const int RightEye = 1;
     private const int EyeCount = 2;
+    private const float EyeOriginHorizontalOffset = 0.032f;
     private static readonly string[] EyeNames = { "Left", "Right" };
 
     [Header("Visualization")]
@@ -120,6 +121,28 @@ public class EyeTracker : MonoBehaviour
         {
             AdvanceGridAccuracyTest();
         }
+    }
+
+    private void OnDrawGizmos()
+    {
+        for (int eyeIndex = 0; eyeIndex < EyeCount; eyeIndex++)
+        {
+            if (gazeSpheres[eyeIndex] == null)
+                continue;
+
+            Gizmos.color = eyeIndex == LeftEye ? Color.cyan : Color.magenta;
+            Vector3 gazeOriginWorld = transform.TransformPoint(GetEyeGazeOriginLocal(eyeIndex));
+            Gizmos.DrawLine(gazeOriginWorld, gazeSpheres[eyeIndex].transform.position);
+        }
+    }
+
+    private static Vector3 GetEyeGazeOriginLocal(int eyeIndex)
+    {
+        return new Vector3(
+            eyeIndex == LeftEye ? -EyeOriginHorizontalOffset : EyeOriginHorizontalOffset,
+            0f,
+            0f
+        );
     }
 
     private void ToggleCalibrationAccuracyGrid()
@@ -336,7 +359,7 @@ public class EyeTracker : MonoBehaviour
         background.transform.SetParent(labelRoot.transform, false);
         background.transform.localPosition = Vector3.zero;
         background.transform.localRotation = Quaternion.identity;
-        background.transform.localScale = new Vector3(0.32f, 0.06f, 1f);
+        background.transform.localScale = new Vector3(0.64f, 0.06f, 1f);
 
         Collider backgroundCollider = background.GetComponent<Collider>();
         if (backgroundCollider != null)
@@ -809,7 +832,8 @@ public class EyeTracker : MonoBehaviour
 
             float diameter = sphereRadius * 2.0f;
             gazeSpheres[eyeIndex].transform.localScale = new Vector3(diameter, diameter, diameter);
-            gazeSpheres[eyeIndex].transform.localPosition = Vector3.forward * sphereDistance;
+            gazeSpheres[eyeIndex].transform.localPosition =
+                GetEyeGazeOriginLocal(eyeIndex) + Vector3.forward * sphereDistance;
             gazeSpheres[eyeIndex].transform.localRotation = Quaternion.identity;
 
             Renderer renderer = gazeSpheres[eyeIndex].GetComponent<Renderer>();
@@ -925,7 +949,8 @@ public class EyeTracker : MonoBehaviour
                 : unityLocalDirection;
 
             if (gazeSpheres[eyeIndex] != null)
-                gazeSpheres[eyeIndex].transform.localPosition = correctedDirection * sphereDistance;
+                gazeSpheres[eyeIndex].transform.localPosition =
+                    GetEyeGazeOriginLocal(eyeIndex) + correctedDirection * sphereDistance;
         }
 
         if (calibrationComplete
