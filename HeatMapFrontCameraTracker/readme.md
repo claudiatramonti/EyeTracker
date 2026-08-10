@@ -140,3 +140,40 @@ This is the same *idea* as the combined gaze sphere in Unity stereo mode, but ma
 | `3DTracker/Orlosky3DEyeTrackerStereo.py` | Stereo IR, Unity VR, no heatmap |
 | `FrontCameraTracker/` | Single IR + front camera, red dot, no heatmap |
 | **This folder** | Stereo IR + optional front + **monitor heatmap** |
+
+## ArUco markers (front camera)
+
+Optional screen registration using printed markers on the monitor corners.
+
+### Phase 0 — Generate markers
+
+```bash
+python generate_aruco_markers.py
+```
+
+Print the PNGs in `aruco_markers/` and tape them to the monitor:
+
+```text
+[0] top-left          [1] top-right
+[3] bottom-left       [2] bottom-right
+```
+
+### Phase 1 — Test front camera only
+
+```bash
+python test_aruco_front.py 2
+```
+
+Replace `2` with your front camera index. Press **Q** to quit.
+
+### Phase 2 — Integrated in main app
+
+Run `HeatMapFrontCameraTracker.py` with **Front camera** enabled. The window **External Camera (Gaze)** shows:
+
+- Detected markers (green boxes + ID labels)
+- Cyan monitor outline when all 4 corner IDs are visible
+- Status line on the heatmap HUD (`ArUco homography: OK`)
+
+### Phase 3 (future)
+
+Use the homography matrix to map front-camera geometry into heatmap pixels together with IR gaze (not wired to heatmap recording yet).

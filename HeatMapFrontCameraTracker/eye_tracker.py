@@ -55,6 +55,9 @@ smoothed_combined_gaze_dir = None
 _smoothed_circle_u = None
 _smoothed_circle_v = None
 
+# When False, tracking runs silently and stores preview_frame for heatmap PiP.
+show_separate_tracking_windows = False
+
 
 def create_eye_tracking_state():
     return {
@@ -69,6 +72,7 @@ def create_eye_tracking_state():
         "sphere_center_locked_2d": False,
         "locked_model_center_avg": (320, 240),
         "gaze_output": [0.0] * 6,
+        "preview_frame": None,
     }
 
 
@@ -516,6 +520,11 @@ def _show_tracking_windows(frame, gl_image=None, status_text=None):
     if status_text:
         cv2.putText(frame, status_text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
         cv2.putText(frame, status_text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+    eye_tracking_states[current_eye_id]["preview_frame"] = frame.copy()
+
+    if not show_separate_tracking_windows:
+        return
 
     cv2.imshow(eye_window_name("Tracking"), frame)
 
@@ -1105,6 +1114,18 @@ def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_heigh
         sphere_center_out = sphere_center
 
     return sphere_center_out, gaze_rotated
+
+def get_preview_frame(eye_id):
+    frame = eye_tracking_states[eye_id].get("preview_frame")
+    if frame is None:
+        return None
+    return frame.copy()
+
+
+def set_show_separate_tracking_windows(enabled):
+    global show_separate_tracking_windows
+    show_separate_tracking_windows = bool(enabled)
+
 
 def on_mouse_frame_with_rays(event, x, y, flags, param):
     """Left-click on an eye tracking window to lock that eye's sphere center."""

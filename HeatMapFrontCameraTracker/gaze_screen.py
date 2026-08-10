@@ -287,7 +287,7 @@ class GazeHeatmapSession:
             cv2.putText(frame, "Look here, press R (optional)", (right_x - 220, int(self.cy) - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-    def draw_hud(self, frame, fps, camera_status=None):
+    def draw_hud(self, frame, fps, camera_status=None, aruco_status=None, origin=(20, 30)):
         if not self.center_calibrated:
             status = "Step 1: press C at screen center"
         elif not self.vertical_calibrated:
@@ -300,32 +300,62 @@ class GazeHeatmapSession:
             f"Hits: {self.hits}",
             f"Loop FPS: {fps:.1f}",
             "C=center  B=bottom  R=right  H=reset cal  X=swap axes",
-            "K=reset heatmap  S=save  Q=quit",
+            "K=reset heatmap  S=save  V=cameras  M=ArUco corners  Q=quit",
         ]
 
         status_lines = format_camera_status_lines(camera_status) if camera_status else []
         for index, line in enumerate(status_lines):
             lines.insert(3 + index, line)
 
+        insert_at = 3 + len(status_lines)
+        if aruco_status:
+            lines.insert(insert_at, aruco_status)
+            insert_at += 1
+
         if self.last_yaw_pitch is not None:
             yaw, pitch = self.last_yaw_pitch
-            lines.insert(3 + len(status_lines), f"Yaw: {yaw:+.4f}  Pitch: {pitch:+.4f}")
+            lines.insert(insert_at, f"Yaw: {yaw:+.4f}  Pitch: {pitch:+.4f}")
 
-        y = 30
+        x0, y0 = origin
+        line_height = 28
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.65
+        thickness = 2
+        max_text_w = 0
         for text in lines:
-            cv2.putText(frame, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3)
-            cv2.putText(frame, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-            y += 28
+            size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+            max_text_w = max(max_text_w, size[0])
 
-    def render(self, fps, camera_status=None):
+        pad = 10
+        box_x1 = max(0, x0 - pad)
+        box_y1 = max(0, y0 - 24)
+        box_x2 = min(frame.shape[1] - 1, x0 + max_text_w + pad * 2)
+        box_y2 = min(frame.shape[0] - 1, y0 + len(lines) * line_height + pad)
+
+        panel = frame.copy()
+        cv2.rectangle(panel, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 0), -1)
+        cv2.addWeighted(panel, 0.72, frame, 0.28, 0, frame)
+
+        y = y0
+        for text in lines:
+            cv2.putText(frame, text, (x0, y), font, font_scale, (0, 0, 0), 3)
+            cv2.putText(frame, text, (x0, y), font, font_scale, (255, 255, 255), thickness)
+            y += line_height
+
+    def compose_display(self, fps):
+        """Heatmap layer with calibration guides and gaze crosshair (no HUD)."""
         heatmap = render_heatmap(self.accumulator)
         display = cv2.addWeighted(heatmap, 0.85, np.zeros_like(heatmap), 0.15, 0)
-        self.draw_hud(display, fps, camera_status=camera_status)
         self.draw_calibration_guides(display)
 
         if self.ready and self.last_point is not None:
             cv2.drawMarker(display, self.last_point, (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
 
+        return display
+
+    def render(self, fps, camera_status=None, aruco_status=None, hud_origin=(20, 30)):
+        display = self.compose_display(fps)
+        self.draw_hud(display, fps, camera_status=camera_status, aruco_status=aruco_status, origin=hud_origin)
         return display
 
     def save_png(self, path):
