@@ -192,6 +192,88 @@ class ArucoScreenTracker:
         return "ArUco: none"
 
 
+def gaze_to_front_camera_pixels(
+    gaze_direction,
+    R_gaze_to_cam,
+    cam_width,
+    cam_height,
+    cam_cx=None,
+    cam_cy=None,
+    cam_fx=600.0,
+    cam_fy=600.0,
+):
+    """Project fused IR gaze into front-camera pixel coordinates."""
+    direction = np.asarray(gaze_direction, dtype=np.float32)
+    norm = np.linalg.norm(direction)
+    if norm < 1e-6:
+        return None
+
+    rotation = np.asarray(R_gaze_to_cam, dtype=np.float32)
+    g = rotation @ (direction / norm)
+    if g[2] <= 1e-6:
+        return None
+
+    cx = cam_width * 0.5 if cam_cx is None else cam_cx
+    cy = cam_height * 0.5 if cam_cy is None else cam_cy
+    u = float(cx + cam_fx * (g[0] / g[2]))
+    v = float(cy - cam_fy * (g[1] / g[2]))
+    return u, v
+
+
+def front_camera_to_screen(u, v, homography, screen_width, screen_height):
+    """Map a front-camera pixel to monitor coordinates using ArUco homography."""
+    if homography is None:
+        return None
+
+    point = np.array([[[u, v]]], dtype=np.float32)
+    try:
+        mapped = cv2.perspectiveTransform(point, homography)
+    except cv2.error:
+        return None
+
+    x, y = mapped[0, 0]
+    if not np.isfinite(x) or not np.isfinite(y):
+        return None
+
+    sx = int(np.clip(round(x), 0, screen_width - 1))
+    sy = int(np.clip(round(y), 0, screen_height - 1))
+    return sx, sy
+
+
+def project_gaze_to_monitor_pixels(
+    gaze_direction,
+    R_gaze_to_cam,
+    homography,
+    screen_width,
+    screen_height,
+    cam_width,
+    cam_height,
+    cam_cx=None,
+    cam_cy=None,
+    cam_fx=600.0,
+    cam_fy=600.0,
+):
+    """
+    Full chain: IR gaze → front-camera UV → homography → monitor pixel (x, y).
+
+    Requires R_gaze_to_cam from pressing C (links IR space to front camera).
+    Requires homography from 4/4 ArUco corner markers on the front camera.
+    """
+    uv = gaze_to_front_camera_pixels(
+        gaze_direction,
+        R_gaze_to_cam,
+        cam_width,
+        cam_height,
+        cam_cx=cam_cx,
+        cam_cy=cam_cy,
+        cam_fx=cam_fx,
+        cam_fy=cam_fy,
+    )
+    if uv is None:
+        return None
+    return front_camera_to_screen(uv[0], uv[1], homography, screen_width, screen_height)
+
+
 def generate_marker_sheet(output_dir, marker_ids=(0, 1, 2, 3), side_pixels=320, margin=24):
     """Save one PNG per marker ID for printing."""
     os.makedirs(output_dir, exist_ok=True)
@@ -352,6 +434,22 @@ class ScreenCornerMarkers:
     def toggle(self):
         self.visible = not self.visible
         return self.visible
+
+    def hud_safe_zone(self, pad=16):
+        """
+        Horizontal band cleared of corner ArUco markers (for centered top HUD).
+        Returns dict with left, top, width.
+        """
+        size = self.marker_size
+        margin = self.margin
+        left = margin + size + pad
+        right = self.screen_width - margin - size - pad
+        width = max(280, right - left)
+        return {
+            "left": left,
+            "top": 30,
+            "width": width,
+        }
 
     def status_line(self):
         state = "ON" if self.visible else "OFF"

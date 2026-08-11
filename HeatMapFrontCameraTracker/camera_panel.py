@@ -12,13 +12,15 @@ class CameraPanelOverlay:
     SLOT_ORDER = ("left", "right", "front")
     SLOT_LABELS = {"left": "Left IR", "right": "Right IR", "front": "Front"}
 
-    def __init__(self, screen_width, screen_height, panel_height=220, margin=16, gap=12):
+    def __init__(self, screen_width, screen_height, panel_height=None, margin=16, gap=14):
         self.screen_width = screen_width
         self.screen_height = screen_height
+        if panel_height is None:
+            panel_height = max(280, min(380, int(screen_height * 0.28)))
         self.panel_height = panel_height
         self.margin = margin
         self.gap = gap
-        self.visible = False
+        self.visible = True
         self._frames = {slot: None for slot in self.SLOT_ORDER}
         self._active_slots = []
         self._layout = {}
@@ -47,9 +49,9 @@ class CameraPanelOverlay:
         if count == 0:
             return
 
-        max_cluster_w = int(self.screen_width * 0.65)
+        max_cluster_w = int(self.screen_width * 0.75)
         usable_w = max_cluster_w - self.gap * (count - 1)
-        panel_w = max(160, usable_w // count)
+        panel_w = max(200, usable_w // count)
         total_w = count * panel_w + (count - 1) * self.gap
 
         x_start = (self.screen_width - total_w) // 2
@@ -99,8 +101,8 @@ class CameraPanelOverlay:
             out[y0 : y0 + h, x0 : x0 + w] = preview
 
             label = self.SLOT_LABELS.get(slot_id, slot_id)
-            cv2.putText(out, label, (x0 + 8, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
-            cv2.putText(out, label, (x0 + 8, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(out, label, (x0 + 8, y0 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
+            cv2.putText(out, label, (x0 + 8, y0 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
             cv2.rectangle(out, (x0, y0), (x0 + w, y0 + h), (180, 180, 180), 1)
 
         return out

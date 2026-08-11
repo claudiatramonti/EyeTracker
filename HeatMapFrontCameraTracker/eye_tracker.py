@@ -49,7 +49,8 @@ circle_x = EXT_CX
 circle_y = EXT_CY
 
 # Exponential smoothing for fused gaze (heatmap + front-camera dot).
-GAZE_DIRECTION_SMOOTH_ALPHA = 0.22
+# Higher alpha = faster response, lower = less jitter.
+GAZE_DIRECTION_SMOOTH_ALPHA = 0.50
 GAZE_CIRCLE_SMOOTH_ALPHA = 0.35
 smoothed_combined_gaze_dir = None
 _smoothed_circle_u = None
@@ -860,38 +861,36 @@ def rotation_from_a_to_b(a, b):
     Compute rotation matrix R such that R @ a = b
     using Rodrigues' rotation formula.
     """
-    a = a / np.linalg.norm(a)
-    b = b / np.linalg.norm(b)
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    a /= np.linalg.norm(a)
+    b /= np.linalg.norm(b)
 
-    v = np.cross(a, b)
-    c = np.dot(a, b)
+    cross = np.cross(a, b)
+    sine = float(np.linalg.norm(cross))
+    cosine = float(np.clip(np.dot(a, b), -1.0, 1.0))
 
-    if np.linalg.norm(v) < 1e-6:
-        # Vectors are parallel or nearly so
-        if c > 0:
+    if sine < 1e-6:
+        if cosine > 0.0:
             return np.eye(3, dtype=np.float32)
-        else:
-            # 180-degree flip: choose any axis orthogonal to a
-            axis = np.array([1.0, 0.0, 0.0])
-            if abs(a[0]) > 0.9:
-                axis = np.array([0.0, 1.0, 0.0])
-            v = np.cross(a, axis)
-            v = v / np.linalg.norm(v)
-            s = np.linalg.norm(v)
-    else:
-        s = np.linalg.norm(v)
-        v = v / s
+        axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        if abs(a[0]) > 0.9:
+            axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        axis -= a * np.dot(axis, a)
+        axis /= np.linalg.norm(axis)
+        return (2.0 * np.outer(axis, axis) - np.eye(3)).astype(np.float32)
 
-    # Skew-symmetric cross-product matrix
-    vx, vy, vz = v
-    K = np.array([
-        [0,    -vz,  vy],
-        [vz,    0,  -vx],
-        [-vy,  vx,   0 ]
-    ], dtype=np.float32)
-
-    R = np.eye(3, dtype=np.float32) + K * s + (K @ K) * ((1 - c) / (s ** 2))
-    return R
+    axis = cross / sine
+    ax, ay, az = axis
+    K = np.array(
+        [[0.0, -az, ay], [az, 0.0, -ax], [-ay, ax, 0.0]],
+        dtype=np.float32,
+    )
+    return (
+        np.eye(3, dtype=np.float32)
+        + K * sine
+        + (K @ K) * (1.0 - cosine)
+    ).astype(np.float32)
 
 def update_gaze_circle_from_current_gaze():
     """

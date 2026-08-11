@@ -174,6 +174,14 @@ Run `HeatMapFrontCameraTracker.py` with **Front camera** enabled. The window **E
 - Cyan monitor outline when all 4 corner IDs are visible
 - Status line on the heatmap HUD (`ArUco homography: OK`)
 
-### Phase 3 (future)
+### Phase 3 — ArUco drives heatmap (integrated)
 
-Use the homography matrix to map front-camera geometry into heatmap pixels together with IR gaze (not wired to heatmap recording yet).
+When **Front camera** is enabled and all **4 ArUco markers** are visible:
+
+1. IR gaze → front-camera pixel (via `R_gaze_to_cam` from **C** at screen center)
+2. Front-camera pixel → monitor pixel (via ArUco **homography**)
+3. Heatmap records at that screen position
+
+Press **C** once at physical screen center (links IR to front cam). **B/R are not needed** when HUD shows `Mapping: ArUco`.
+
+If ArUco is not ready, the app falls back to manual **C/B/R** calibration.

@@ -71,7 +71,7 @@ def selection_gui():
     flip_left_var = tk.BooleanVar(value=True)
     flip_right_var = tk.BooleanVar(value=False)
     mirror_left_var = tk.BooleanVar(value=False)
-    mirror_right_var = tk.BooleanVar(value=False)
+    mirror_right_var = tk.BooleanVar(value=True)
     flip_front_var = tk.BooleanVar(value=False)
     mirror_front_var = tk.BooleanVar(value=False)
     flip_frame = ttk.Frame(root)
@@ -118,7 +118,7 @@ def selection_gui():
 
     tk.Label(
         root,
-        text="Single window: V toggles camera previews (center) | click IR preview to lock sphere",
+        text="Window fits above taskbar. V hides camera previews | click IR preview to lock sphere",
         font=("Arial", 9),
     ).pack(pady=4)
 

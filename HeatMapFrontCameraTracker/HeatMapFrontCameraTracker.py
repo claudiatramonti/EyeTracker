@@ -10,7 +10,7 @@ Usage:
 Select left/right IR cameras and optional front camera in the GUI.
 Gaze on the heatmap uses the combined left+right direction (VR-style fusion).
 
-Calibration on heatmap window: C=center, B=bottom, R=right (optional)
+Calibration on heatmap window: C=center, arrow keys at screen edges (up/down/left/right)
 ArUco corner markers on screen when front camera is enabled (M to toggle).
 """
 
