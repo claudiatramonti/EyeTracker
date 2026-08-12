@@ -12,9 +12,9 @@ This module does **not** import from `FrontCameraTracker/` or `3DTracker/`. All 
 
 1. Tracks the pupil in each IR stream and computes a 3D gaze direction per eye.
 2. **Fuses** left + right into one combined gaze direction (normalized average).
-3. Maps combined gaze to monitor pixels using angular calibration (**C** / **B** / **R**).
-4. Draws a live heatmap overlay on a fullscreen OpenCV window.
-5. Optionally shows gaze on the front camera feed (red circle).
+3. Maps combined gaze with a five-point calibration (**C** + four arrow keys).
+4. With a front camera, estimates the glasses-to-screen 6DoF pose from ArUco markers and compensates head movement.
+5. Draws a live heatmap overlay on a fullscreen OpenCV window.
 6. Writes `gaze_vector.txt` in **12-value stereo format** (left 6 + right 6).
 
 ## Requirements
@@ -72,11 +72,13 @@ Calibrate on the **Gaze Heatmap** window while looking at the matching spot on y
 
 | Step | Key | Action |
 |------|-----|--------|
-| 1 | **C** | Look at **screen center** → locks tracker + sets heatmap rotation |
-| 2 | **B** | Look at **bottom edge** → sets vertical scale (required) |
-| 3 | **R** | Look at **right edge** → optional horizontal fine-tuning |
+| 1 | **C** | Look at the **screen center** |
+| 2 | **↑** | Look at the top target |
+| 3 | **↓** | Look at the bottom target |
+| 4 | **←** | Look at the left target |
+| 5 | **→** | Look at the right target |
 
-Recording starts after **C** and **B** are both set.
+Recording starts after all five points are valid. With a front camera selected, keep at least two ArUco markers visible while saving every point. The HUD shows `Gaze 6DoF: pronto` when head compensation is calibrated.
 
 ### Other keys (heatmap window)
 
@@ -127,8 +129,8 @@ This is the same *idea* as the combined gaze sphere in Unity stereo mode, but ma
 
 ## Tips
 
-- Keep your head relatively still while calibrating and recording.
-- If the heatmap band stays only at the top, complete **B** (bottom) and try **X** (swap axes) or **R** (right).
+- Keep the glasses still while pressing each calibration key; after `Gaze 6DoF: pronto`, normal head movement is compensated.
+- Keep all four markers visible when possible; two are the minimum for pose estimation.
 - For heatmap-only use, set **Front camera** to `None`.
 - Camera indices depend on USB order; use the GUI dropdowns to assign left, right, and front correctly.
 
@@ -174,14 +176,15 @@ Run `HeatMapFrontCameraTracker.py` with **Front camera** enabled. The window **E
 - Cyan monitor outline when all 4 corner IDs are visible
 - Status line on the heatmap HUD (`ArUco homography: OK`)
 
-### Phase 3 — ArUco drives heatmap (integrated)
+### Phase 3 — 6DoF head compensation (integrated)
 
-When **Front camera** is enabled and all **4 ArUco markers** are visible:
+When **Front camera** is enabled:
 
-1. IR gaze → front-camera pixel (via `R_gaze_to_cam` from **C** at screen center)
-2. Front-camera pixel → monitor pixel (via ArUco **homography**)
-3. Heatmap records at that screen position
+1. `solvePnP` estimates the screen-to-front-camera rotation and translation from the marker corners.
+2. The five calibration targets estimate the fixed IR-gaze-to-front-camera rotation.
+3. Every gaze ray is transformed into the current front-camera frame.
+4. The ray is intersected with the current screen plane, compensating glasses/head rotation and translation.
 
-Press **C** once at physical screen center (links IR to front cam). **B/R are not needed** when HUD shows `Mapping: ArUco`.
+Complete **C + ↑ + ↓ + ← + →** while at least two markers are visible. Four visible markers give the most stable pose. Once calibrated, the HUD shows `Mapping: ArUco 6DoF (compensazione testa)`.
 
-If ArUco is not ready, the app falls back to manual **C/B/R** calibration.
+If marker pose is temporarily lost after 6DoF calibration, recording pauses instead of writing incorrect heatmap points. Without a front camera, the same five points provide a static piecewise mapping.

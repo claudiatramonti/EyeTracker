@@ -26,6 +26,25 @@ def _format_fusion_status(fusion_eyes, active_eyes):
     return f"Gaze: {','.join(fusion_eyes)}"
 
 
+def _record_pose_sample(pose_mapper, aruco_tracker, heatmap_session, label, gaze_direction):
+    if pose_mapper is None:
+        return "Posa 6DoF non attiva: front camera disabilitata."
+    if label == "center":
+        target = (heatmap_session.cx, heatmap_session.cy)
+    else:
+        target = gaze_screen.calibration_targets(
+            heatmap_session.width,
+            heatmap_session.height,
+        )[label]
+    _, message = pose_mapper.add_calibration_sample(
+        label,
+        gaze_direction,
+        target,
+        aruco_tracker,
+    )
+    return message
+
+
 def _on_heatmap_mouse(event, x, y, flags, param):
     """Forward clicks on embedded IR previews to the eye tracker sphere lock."""
     panel = param["panel"]
@@ -133,7 +152,23 @@ def run(
     eye_tracker.calibrated = False
     eye_tracker.reset_gaze_smoothing()
 
-    aruco_tracker = aruco_screen.ArucoScreenTracker(screen_w, screen_h) if front_reader else None
+    aruco_tracker = (
+        aruco_screen.ArucoScreenTracker(
+            screen_w,
+            screen_h,
+            marker_size=corner_markers.marker_size,
+            marker_margin=corner_markers.margin,
+            cam_width=eye_tracker.EXT_WIDTH,
+            cam_height=eye_tracker.EXT_HEIGHT,
+            cam_fx=eye_tracker.EXT_FX,
+            cam_fy=eye_tracker.EXT_FY,
+            cam_cx=eye_tracker.EXT_CX,
+            cam_cy=eye_tracker.EXT_CY,
+        )
+        if front_reader
+        else None
+    )
+    pose_mapper = aruco_screen.GazePoseMapper() if aruco_tracker is not None else None
 
     try:
         while True:
@@ -155,24 +190,21 @@ def run(
             combined_gaze = eye_tracker.refresh_combined_gaze(fusion_eyes)
             calibration_gaze = eye_tracker.get_raw_combined_gaze_dir()
 
-            use_calibrated_mapping = heatmap_session.mapping_ready
-            ir_calibrating = heatmap_session.calibrating
-            use_aruco_mapping = (
-                not use_calibrated_mapping
-                and not ir_calibrating
-                and not heatmap_session.center_calibrated
-                and aruco_tracker is not None
-                and aruco_tracker.ready
-                and eye_tracker.calibrated
-            )
-            aruco_available = aruco_tracker is not None and aruco_tracker.ready
-
             if front_reader is not None:
                 ret_ext, ext_frame = front_reader.read()
                 if ret_ext:
                     fh, fw = ext_frame.shape[:2]
                     if fw != eye_tracker.EXT_WIDTH or fh != eye_tracker.EXT_HEIGHT:
                         eye_tracker.configure_external_viewport(fw, fh)
+                    if aruco_tracker is not None:
+                        aruco_tracker.configure_camera(
+                            fw,
+                            fh,
+                            fx=eye_tracker.EXT_FX,
+                            fy=eye_tracker.EXT_FY,
+                            cx=eye_tracker.EXT_CX,
+                            cy=eye_tracker.EXT_CY,
+                        )
 
                     display = ext_frame
                     if (fw, fh) != (eye_tracker.EXT_WIDTH, eye_tracker.EXT_HEIGHT):
@@ -181,38 +213,41 @@ def run(
                     if aruco_tracker is not None:
                         display = aruco_tracker.process(display)
 
-                    if use_aruco_mapping and combined_gaze is not None:
-                        uv = aruco_screen.gaze_to_front_camera_pixels(
-                            combined_gaze,
-                            eye_tracker.R_gaze_to_cam,
-                            eye_tracker.EXT_WIDTH,
-                            eye_tracker.EXT_HEIGHT,
-                            eye_tracker.EXT_CX,
-                            eye_tracker.EXT_CY,
-                            eye_tracker.EXT_FX,
-                            eye_tracker.EXT_FY,
-                        )
-                        if uv is not None:
-                            cv2.circle(display, (int(uv[0]), int(uv[1])), 7, (0, 0, 255), -1)
-
                     if flip_front:
                         display = cv2.flip(display, 0)
                     if mirror_front:
                         display = cv2.flip(display, 1)
                     camera_panel.set_frame("front", display)
+                elif aruco_tracker is not None:
+                    aruco_tracker.ready = False
+                    aruco_tracker.pose_ready = False
 
-            if use_aruco_mapping:
-                heatmap_session.update_via_aruco(
-                    combined_gaze,
-                    aruco_tracker.homography,
-                    eye_tracker.R_gaze_to_cam,
-                    eye_tracker.EXT_WIDTH,
-                    eye_tracker.EXT_HEIGHT,
-                    eye_tracker.EXT_CX,
-                    eye_tracker.EXT_CY,
-                    eye_tracker.EXT_FX,
-                    eye_tracker.EXT_FY,
-                )
+            ir_calibrating = heatmap_session.calibrating
+            pose_available = aruco_tracker is not None and aruco_tracker.pose_ready
+            pose_calibrated = pose_mapper is not None and pose_mapper.calibrated
+            use_pose_mapping = (
+                heatmap_session.mapping_ready
+                and pose_calibrated
+                and pose_available
+            )
+            pose_tracking_lost = (
+                heatmap_session.mapping_ready
+                and pose_calibrated
+                and not pose_available
+            )
+            use_calibrated_mapping = (
+                heatmap_session.mapping_ready
+                and not pose_calibrated
+            )
+            aruco_available = aruco_tracker is not None and aruco_tracker.ready
+
+            if use_pose_mapping:
+                pose_point = pose_mapper.project(combined_gaze, aruco_tracker)
+                heatmap_session.update_screen_point(pose_point)
+            elif pose_tracking_lost:
+                # Never fall back to a head-fixed mapping after 6DoF calibration:
+                # stale marker pose would write confidently wrong heatmap points.
+                heatmap_session.update_screen_point(None)
             else:
                 heatmap_session.update(combined_gaze)
             now = time.perf_counter()
@@ -224,9 +259,18 @@ def run(
                 camera_status["front"] = front_reader.snapshot_status()
 
             hud_extra_lines = []
-            if use_calibrated_mapping:
+            if use_pose_mapping:
                 hud_extra_lines.append(
-                    f"Mapping: piecewise (5 punti) | "
+                    f"Mapping: ArUco 6DoF (compensazione testa) | "
+                    f"{_format_fusion_status(fusion_eyes, active_eyes)}"
+                )
+            elif pose_tracking_lost:
+                hud_extra_lines.append(
+                    "Mapping: 6DoF IN PAUSA - mostra almeno 2 marker ArUco"
+                )
+            elif use_calibrated_mapping:
+                hud_extra_lines.append(
+                    f"Mapping: piecewise statico (5 punti) | "
                     f"{_format_fusion_status(fusion_eyes, active_eyes)}"
                 )
             elif ir_calibrating:
@@ -234,13 +278,11 @@ def run(
                     f"Mapping: calibrazione IR ({len(heatmap_session.calibrated_edges)}/4 bordi) | "
                     f"{_format_fusion_status(fusion_eyes, active_eyes)}"
                 )
-            elif use_aruco_mapping:
-                hud_extra_lines.append(f"Mapping: ArUco | {_format_fusion_status(fusion_eyes, active_eyes)}")
             elif heatmap_session.ready:
-                hud_extra_lines.append(f"Mapping: partial C/B/R | {_format_fusion_status(fusion_eyes, active_eyes)}")
-            elif aruco_available:
+                hud_extra_lines.append(f"Mapping: 5 punti | {_format_fusion_status(fusion_eyes, active_eyes)}")
+            elif pose_available:
                 hud_extra_lines.append(
-                    f"Mapping: premi C per calibrazione IR (ArUco disponibile) | "
+                    f"Mapping: premi C per calibrazione IR + posa 6DoF | "
                     f"{_format_fusion_status(fusion_eyes, active_eyes)}"
                 )
             else:
@@ -250,6 +292,8 @@ def run(
                 hud_extra_lines.append(corner_markers.status_line())
             if aruco_tracker is not None:
                 hud_extra_lines.append(aruco_tracker.status_line())
+            if pose_mapper is not None:
+                hud_extra_lines.append(pose_mapper.status_line())
 
             heatmap_display = heatmap_session.compose_display(
                 heatmap_fps,
@@ -290,26 +334,63 @@ def run(
                     print("No combined gaze vector yet.")
                 else:
                     eye_tracker.calibrated = False
-                    _, message = heatmap_session.set_center_calibration(calibration_gaze)
+                    saved, message = heatmap_session.set_center_calibration(calibration_gaze)
                     eye_tracker.reset_gaze_smoothing()
                     print(message)
+                    if saved and pose_mapper is not None:
+                        pose_mapper.reset()
+                        pose_message = _record_pose_sample(
+                            pose_mapper,
+                            aruco_tracker,
+                            heatmap_session,
+                            "center",
+                            calibration_gaze,
+                        )
+                        if pose_message:
+                            print(pose_message)
                     print("Guarda il MONITOR fisico. I punti verdi sono gli ancoraggi salvati.")
             elif key == ord("h"):
                 eye_tracker.calibrated = False
                 _, message = heatmap_session.handle_key(key, combined_gaze)
+                if pose_mapper is not None:
+                    pose_mapper.reset()
                 print(message)
             elif key == KEY_UP:
-                _, message = heatmap_session.calibrate_top(calibration_gaze)
+                saved, message = heatmap_session.calibrate_top(calibration_gaze)
                 print(message)
+                if saved:
+                    print(
+                        _record_pose_sample(
+                            pose_mapper, aruco_tracker, heatmap_session, "top", calibration_gaze
+                        )
+                    )
             elif key == KEY_DOWN:
-                _, message = heatmap_session.calibrate_bottom(calibration_gaze)
+                saved, message = heatmap_session.calibrate_bottom(calibration_gaze)
                 print(message)
+                if saved:
+                    print(
+                        _record_pose_sample(
+                            pose_mapper, aruco_tracker, heatmap_session, "bottom", calibration_gaze
+                        )
+                    )
             elif key == KEY_LEFT:
-                _, message = heatmap_session.calibrate_left(calibration_gaze)
+                saved, message = heatmap_session.calibrate_left(calibration_gaze)
                 print(message)
+                if saved:
+                    print(
+                        _record_pose_sample(
+                            pose_mapper, aruco_tracker, heatmap_session, "left", calibration_gaze
+                        )
+                    )
             elif key == KEY_RIGHT:
-                _, message = heatmap_session.calibrate_right(calibration_gaze)
+                saved, message = heatmap_session.calibrate_right(calibration_gaze)
                 print(message)
+                if saved:
+                    print(
+                        _record_pose_sample(
+                            pose_mapper, aruco_tracker, heatmap_session, "right", calibration_gaze
+                        )
+                    )
             elif key == ord("s"):
                 out_path = os.path.join(ROOT_DIR, "gaze_heatmap.png")
                 heatmap_session.save_png(out_path)
@@ -319,18 +400,24 @@ def run(
                 eye_tracker.reset_gaze_smoothing()
                 heatmap_session.reset_calibration()
                 heatmap_session.reset_heatmap()
+                if pose_mapper is not None:
+                    pose_mapper.reset()
                 print("Gaze fusion: both eyes. Calibrazione resettata: premi C.")
             elif key == ord("1") and "left" in active_eyes:
                 fusion_eyes = ("left",)
                 eye_tracker.reset_gaze_smoothing()
                 heatmap_session.reset_calibration()
                 heatmap_session.reset_heatmap()
+                if pose_mapper is not None:
+                    pose_mapper.reset()
                 print("Gaze fusion: LEFT eye only. Calibrazione resettata: premi C.")
             elif key == ord("2") and "right" in active_eyes:
                 fusion_eyes = ("right",)
                 eye_tracker.reset_gaze_smoothing()
                 heatmap_session.reset_calibration()
                 heatmap_session.reset_heatmap()
+                if pose_mapper is not None:
+                    pose_mapper.reset()
                 print("Gaze fusion: RIGHT eye only. Calibrazione resettata: premi C.")
             else:
                 handled, message = heatmap_session.handle_key(key, combined_gaze)

@@ -608,7 +608,11 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     
     final_rotated_rect = None
 
-    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0] > 5):
+    if (
+        final_contours
+        and not isinstance(final_contours[0], list)
+        and len(final_contours[0]) > 5
+    ):
         ellipse = cv2.fitEllipse(final_contours[0])
         final_rotated_rect = ellipse
 
@@ -1024,10 +1028,7 @@ def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_heigh
     discriminant = b**2 - 4 * a * c
     if discriminant < 0:
         # Compute the closest point to the sphere (tangent point approximation)
-        t = -np.dot(direction, L) / np.dot(direction, direction)
-        intersection_point = origin + t * direction
-        intersection_local = intersection_point - sphere_center
-        target_direction = intersection_local / np.linalg.norm(intersection_local)
+        t = -np.dot(direction, L) / a
     else:
         sqrt_disc = np.sqrt(discriminant)
         t1 = (-b - sqrt_disc) / (2 * a)
@@ -1046,28 +1047,10 @@ def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_heigh
     # Final intersection point
     intersection_point = origin + t * direction
     intersection_local = intersection_point - sphere_center
-    target_direction = intersection_local / np.linalg.norm(intersection_local)
-
-    sqrt_disc = np.sqrt(discriminant)
-    t1 = (-b - sqrt_disc) / (2 * a)
-    t2 = (-b + sqrt_disc) / (2 * a)
-
-    t = None
-    if t1 > 0 and t2 > 0:
-        t = min(t1, t2)
-    elif t1 > 0:
-        t = t1
-    elif t2 > 0:
-        t = t2
-    if t is None:
+    intersection_norm = np.linalg.norm(intersection_local)
+    if not np.isfinite(intersection_norm) or intersection_norm < 1e-6:
         return None, None
-
-    # Final intersection point
-    intersection_point = origin + t * direction
-
-    # Convert to local space relative to sphere center
-    intersection_local = intersection_point - sphere_center
-    target_direction = intersection_local / np.linalg.norm(intersection_local)
+    target_direction = intersection_local / intersection_norm
 
     # Local green ring direction
     circle_local_center = np.array([0.0, 0.0, inner_radius])

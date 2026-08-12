@@ -586,6 +586,23 @@ class GazeHeatmapSession:
         if self.ready:
             self._apply_gaze_point(self._project_point(direction))
 
+    def update_screen_point(self, point):
+        """Record a gaze point already expressed in monitor pixel coordinates."""
+        self.last_point = None
+        self.last_yaw_pitch = None
+        if point is None:
+            return False
+
+        u, v = point
+        if not np.isfinite(u) or not np.isfinite(v):
+            return False
+        u = int(np.clip(round(u), 0, self.width - 1))
+        v = int(np.clip(round(v), 0, self.height - 1))
+        rel_x = (u - self.cx) / max(self.cx, 1.0)
+        rel_y = (self.cy - v) / max(self.cy, 1.0)
+        self.last_yaw_pitch = (rel_x, rel_y)
+        return self._apply_gaze_point((u, v))
+
     def update_via_aruco(self, direction, homography, R_gaze_to_cam, cam_width, cam_height, cam_cx, cam_cy, cam_fx, cam_fy):
         """Map gaze through front camera + ArUco homography (no C/B/R scales)."""
         direction = normalize_direction(direction)
@@ -608,26 +625,7 @@ class GazeHeatmapSession:
             cam_fx=cam_fx,
             cam_fy=cam_fy,
         )
-        if point is None:
-            return False
-
-        u, v = point
-        rel_x = (u - self.cx) / max(self.cx, 1.0)
-        rel_y = (self.cy - v) / max(self.cy, 1.0)
-        self.last_yaw_pitch = (rel_x, rel_y)
-
-        if self._display_u is None:
-            self._display_u, self._display_v = float(u), float(v)
-        else:
-            alpha = DISPLAY_SMOOTH_ALPHA
-            self._display_u = (1.0 - alpha) * self._display_u + alpha * u
-            self._display_v = (1.0 - alpha) * self._display_v + alpha * v
-
-        smooth_point = (int(round(self._display_u)), int(round(self._display_v)))
-        self.last_point = smooth_point
-        cv2.circle(self.accumulator, smooth_point, self.radius, 1.0, -1)
-        self.hits += 1
-        return True
+        return self.update_screen_point(point)
 
     def draw_calibration_guides(self, frame, aruco_mapping=False):
         if aruco_mapping:
