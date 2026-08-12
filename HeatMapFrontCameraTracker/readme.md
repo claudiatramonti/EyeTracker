@@ -208,7 +208,8 @@ Run `HeatMapFrontCameraTracker.py` with **Front camera** enabled. The window **E
 Requires **Front camera** plus `front_camera_calibration.npz` (see above):
 
 1. Filtered `solvePnP` estimates the screen-to-front-camera pose from ≥3 marker corners.
-2. Each calibration key captures a short multi-frame burst of **per-eye** IR gaze and stores independent IR↔front extrinsics.
+2. Each calibration key uses a short rolling average of recent per-eye IR gaze
+   (and matching ArUco pose) collected by the live loop — no blocking burst.
 3. At runtime each calibrated eye is projected to the screen plane; pixel results are averaged.
 4. If markers are briefly lost, the app falls back to the static five-point map until pose returns.
 

@@ -45,8 +45,10 @@ MARKER_SOURCE_BORDER = 24
 MIN_POSE_MARKERS = 3
 MAX_POSE_REPROJECTION_ERROR_PX = 10.0
 POSE_SMOOTH_ALPHA = 0.28
-CALIBRATION_BURST_FRAMES = 18
-MAX_GAZE_POSE_ANGULAR_RMS_DEG = 8.0
+# Recent main-loop samples used when pressing C/arrows (no blocking burst).
+CALIBRATION_HISTORY_FRAMES = 10
+CALIBRATION_HISTORY_MIN = 3
+MAX_GAZE_POSE_ANGULAR_RMS_DEG = 15.0
 MAX_EYE_ORIGIN_NORM = 600.0
 
 
@@ -655,6 +657,21 @@ class GazePoseMapper:
         self.rotation_gaze_to_camera = None
         self.origin_gaze_in_camera = np.zeros(3, dtype=np.float64)
 
+    @staticmethod
+    def _angular_rms_deg(rotation, origin, gaze_rows, target_positions):
+        target_rows = target_positions - origin
+        target_row_norms = np.linalg.norm(target_rows, axis=1)
+        if np.any(target_row_norms < 1e-9):
+            return None
+        target_rows = target_rows / target_row_norms[:, None]
+        predicted = (rotation @ gaze_rows.T).T
+        dots = np.clip(np.sum(predicted * target_rows, axis=1), -1.0, 1.0)
+        angular_errors = np.degrees(np.arccos(dots))
+        angular_rms = float(np.sqrt(np.mean(angular_errors * angular_errors)))
+        if not np.isfinite(angular_rms):
+            return None
+        return angular_rms
+
     def _fit_eye_extrinsics(self, eye_samples):
         ordered = sorted(self.REQUIRED_LABELS)
         gaze_rows = np.asarray(
@@ -669,6 +686,7 @@ class GazePoseMapper:
         if np.any(target_norms < 1e-9):
             return None, None, None
 
+        # Candidate A: rotation-only (origin at front-camera).
         target_rows = target_positions / target_norms[:, None]
         try:
             u, _, vt = np.linalg.svd(gaze_rows.T @ target_rows)
@@ -678,8 +696,12 @@ class GazePoseMapper:
         if np.linalg.det(rotation) < 0.0:
             vt[-1, :] *= -1.0
             rotation = vt.T @ u.T
-
         origin = np.zeros(3, dtype=np.float64)
+        best_rms = self._angular_rms_deg(rotation, origin, gaze_rows, target_positions)
+        if best_rms is None:
+            return None, None, None
+
+        # Candidate B: optional eye origin via solvePnP. Keep only if it improves RMS.
         if np.all(gaze_rows[:, 2] > 1e-6):
             ideal_image_points = gaze_rows[:, :2] / gaze_rows[:, 2, None]
             try:
@@ -702,43 +724,43 @@ class GazePoseMapper:
                     and np.linalg.norm(estimated_origin) <= MAX_EYE_ORIGIN_NORM
                     and -MAX_EYE_ORIGIN_NORM <= estimated_origin[2] <= 400.0
                 ):
-                    rotation = estimated_rotation
-                    origin = estimated_origin
+                    pnp_rms = self._angular_rms_deg(
+                        estimated_rotation,
+                        estimated_origin,
+                        gaze_rows,
+                        target_positions,
+                    )
+                    if pnp_rms is not None and pnp_rms + 0.05 < best_rms:
+                        rotation = estimated_rotation
+                        origin = estimated_origin
+                        best_rms = pnp_rms
 
-        target_rows = target_positions - origin
-        target_row_norms = np.linalg.norm(target_rows, axis=1)
-        if np.any(target_row_norms < 1e-9):
-            return None, None, None
-        target_rows = target_rows / target_row_norms[:, None]
-        predicted = (rotation @ gaze_rows.T).T
-        dots = np.clip(np.sum(predicted * target_rows, axis=1), -1.0, 1.0)
-        angular_errors = np.degrees(np.arccos(dots))
-        angular_rms = float(np.sqrt(np.mean(angular_errors * angular_errors)))
-        if not np.isfinite(angular_rms) or angular_rms > MAX_GAZE_POSE_ANGULAR_RMS_DEG:
-            return None, None, angular_rms
-        return rotation, origin, angular_rms
+        if best_rms > MAX_GAZE_POSE_ANGULAR_RMS_DEG:
+            return None, None, best_rms
+        return rotation, origin, best_rms
 
-    def add_calibration_sample(
+    def add_calibration_sample_with_target(
         self,
         label,
         gaze_by_eye,
-        screen_point,
-        screen_tracker,
+        target_position_camera,
     ):
+        """Store a sample using an already-averaged camera-frame target point."""
         if label not in self.REQUIRED_LABELS:
             return False, f"Etichetta posa non valida: {label}"
-        if screen_tracker is None or not screen_tracker.pose_ready:
-            return False, "Posa 6DoF non salvata: servono almeno 3 marker ArUco."
+        target_position = np.asarray(target_position_camera, dtype=np.float64)
+        if (
+            target_position.shape != (3,)
+            or not np.all(np.isfinite(target_position))
+            or np.linalg.norm(target_position) < 1e-9
+        ):
+            return False, "Posa 6DoF non salvata: target camera non valido."
 
         if not isinstance(gaze_by_eye, dict):
             gaze_by_eye = {"combined": np.asarray(gaze_by_eye, dtype=np.float64)}
             if "combined" not in self.samples:
                 self.samples["combined"] = {}
                 self.eye_ids = tuple(dict.fromkeys(self.eye_ids + ("combined",)))
-
-        target_position = screen_tracker.screen_point_position_in_camera(*screen_point)
-        if target_position is None:
-            return False, "Posa 6DoF non salvata: target schermo non proiettabile."
 
         saved_eyes = []
         for eye_id, gaze_direction in gaze_by_eye.items():
@@ -753,7 +775,9 @@ class GazePoseMapper:
 
         if not saved_eyes:
             return False, "Posa 6DoF non salvata: nessun vettore occhio valido."
+        return self._finalize_calibration_after_sample(label)
 
+    def _finalize_calibration_after_sample(self, label):
         candidate_extrinsics = dict(self.extrinsics)
         rms_values = []
         for eye_id, eye_samples in self.samples.items():
@@ -805,6 +829,34 @@ class GazePoseMapper:
                 f"Posa gaze 6DoF pronta ({self.angular_rms_deg:.1f}° RMS, occhi: {eyes}).",
             )
         return True, f"Campione posa 6DoF {label} salvato ({ready_count}/5)."
+
+    def add_calibration_sample(
+        self,
+        label,
+        gaze_by_eye,
+        screen_point,
+        screen_tracker,
+    ):
+        if label not in self.REQUIRED_LABELS:
+            return False, f"Etichetta posa non valida: {label}"
+        if screen_tracker is None or not screen_tracker.pose_ready:
+            return False, "Posa 6DoF non salvata: servono almeno 3 marker ArUco."
+
+        if not isinstance(gaze_by_eye, dict):
+            gaze_by_eye = {"combined": np.asarray(gaze_by_eye, dtype=np.float64)}
+            if "combined" not in self.samples:
+                self.samples["combined"] = {}
+                self.eye_ids = tuple(dict.fromkeys(self.eye_ids + ("combined",)))
+
+        target_position = screen_tracker.screen_point_position_in_camera(*screen_point)
+        if target_position is None:
+            return False, "Posa 6DoF non salvata: target schermo non proiettabile."
+
+        return self.add_calibration_sample_with_target(
+            label,
+            gaze_by_eye,
+            target_position,
+        )
 
     def project(self, gaze_direction_or_by_eye, screen_tracker):
         if not self.calibrated or screen_tracker is None or not screen_tracker.pose_ready:

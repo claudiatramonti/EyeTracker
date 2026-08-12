@@ -3,8 +3,10 @@
 import os
 import sys
 import time
+from collections import deque
 
 import cv2
+import numpy as np
 
 import aruco_screen
 import eye_tracker
@@ -39,64 +41,96 @@ def _current_eye_gazes(eye_ids):
     return gazes
 
 
-def _capture_pose_burst(readers, eye_ids, flip_left, flip_right, mirror_left, mirror_right, front_reader, aruco_tracker, frames=None):
-    """Average several frames of per-eye gaze while ArUco pose stays available."""
-    frames = aruco_screen.CALIBRATION_BURST_FRAMES if frames is None else frames
-    samples = {eye_id: [] for eye_id in eye_ids}
-    for _ in range(frames):
-        for eye_id, reader in readers.items():
-            if eye_id not in eye_ids:
-                continue
-            ret, frame = reader.read()
-            if not ret:
-                continue
-            flip_v = flip_left if eye_id == "left" else flip_right
-            mirror = mirror_left if eye_id == "left" else mirror_right
-            eye_tracker.process_frame(
-                frame,
-                eye_id=eye_id,
-                flip_vertical=flip_v,
-                flip_horizontal=mirror,
-            )
+class PoseGazeHistory:
+    """Rolling per-eye gaze + pose samples from the live loop (no UI freeze)."""
 
-        if front_reader is not None and aruco_tracker is not None:
-            ret_ext, ext_frame = front_reader.read()
-            if ret_ext:
-                aruco_tracker.process(ext_frame)
+    def __init__(self, maxlen=None):
+        self.maxlen = (
+            aruco_screen.CALIBRATION_HISTORY_FRAMES if maxlen is None else maxlen
+        )
+        self._by_eye = {}
 
+    def clear(self):
+        self._by_eye.clear()
+
+    def push(self, eye_ids, aruco_tracker):
         if aruco_tracker is None or not aruco_tracker.pose_ready:
-            continue
+            return
+        rotation = aruco_tracker.pose_rotation
+        translation = aruco_tracker.pose_translation
+        if rotation is None or translation is None:
+            return
         for eye_id in eye_ids:
             direction = eye_tracker.get_eye_gaze_dir(eye_id)
-            if direction is not None:
-                samples[eye_id].append(direction)
-        time.sleep(0.01)
+            if direction is None:
+                continue
+            bucket = self._by_eye.setdefault(
+                eye_id,
+                deque(maxlen=self.maxlen),
+            )
+            bucket.append(
+                (
+                    np.asarray(direction, dtype=np.float64).copy(),
+                    rotation.copy(),
+                    translation.copy(),
+                )
+            )
 
-    averaged = {}
-    for eye_id, directions in samples.items():
-        average = aruco_screen.average_unit_directions(directions)
-        if average is not None:
-            averaged[eye_id] = average
-    return averaged
+    def snapshot(self, eye_ids, screen_point, min_samples=None):
+        """Average recent gaze and camera-frame target for one screen point."""
+        min_samples = (
+            aruco_screen.CALIBRATION_HISTORY_MIN
+            if min_samples is None
+            else min_samples
+        )
+        point_screen = np.array(
+            [float(screen_point[0]), float(screen_point[1]), 0.0],
+            dtype=np.float64,
+        )
+        gaze_by_eye = {}
+        target_sums = []
+        for eye_id in eye_ids:
+            bucket = self._by_eye.get(eye_id)
+            if not bucket or len(bucket) < min_samples:
+                continue
+            directions = [entry[0] for entry in bucket]
+            averaged = aruco_screen.average_unit_directions(directions)
+            if averaged is None:
+                continue
+            gaze_by_eye[eye_id] = averaged
+            for _, rotation, translation in bucket:
+                target_sums.append(rotation @ point_screen + translation)
+
+        if not gaze_by_eye or not target_sums:
+            return {}, None
+        target = np.mean(np.asarray(target_sums, dtype=np.float64), axis=0)
+        return gaze_by_eye, target
 
 
-def _record_pose_sample(pose_mapper, aruco_tracker, heatmap_session, label, gaze_by_eye):
+def _calibration_target(heatmap_session, label):
+    if label == "center":
+        return (heatmap_session.cx, heatmap_session.cy)
+    return gaze_screen.calibration_targets(
+        heatmap_session.width,
+        heatmap_session.height,
+    )[label]
+
+
+def _record_pose_sample_from_history(pose_mapper, history, heatmap_session, label, eye_ids):
     if pose_mapper is None:
         return "Posa 6DoF non attiva."
-    if not gaze_by_eye:
-        return "Posa 6DoF non salvata: burst IR vuoto (tieni i marker visibili)."
-    if label == "center":
-        target = (heatmap_session.cx, heatmap_session.cy)
-    else:
-        target = gaze_screen.calibration_targets(
-            heatmap_session.width,
-            heatmap_session.height,
-        )[label]
-    _, message = pose_mapper.add_calibration_sample(
+    target_uv = _calibration_target(heatmap_session, label)
+    gaze_by_eye, target_camera = history.snapshot(eye_ids, target_uv)
+    if not gaze_by_eye or target_camera is None:
+        return (
+            "Posa 6DoF non salvata: servi almeno "
+            f"{aruco_screen.CALIBRATION_HISTORY_MIN} frame recenti con pose ArUco "
+            "(tieni ≥3 marker visibili un momento, poi ripremi)."
+        )
+    _, message = pose_mapper.add_calibration_sample_with_target(
         label,
         gaze_by_eye,
-        target,
-        aruco_tracker,
+        target_camera,
     )
     return message
 
@@ -236,8 +270,8 @@ def run(
                 pose_mapper = aruco_screen.GazePoseMapper(eye_ids=active_eyes)
                 head_pose_enabled = True
                 print(
-                    "Head compensation 6DoF: ON (per-eye, multi-frame). "
-                    "Keep head still while pressing C and arrow keys."
+                    "Head compensation 6DoF: ON (per-eye). "
+                    "Fissa ogni target ~1s con ≥3 marker, poi premi C/frecce (niente freeze)."
                 )
             else:
                 print("Head compensation 6DoF: OFF by flag.")
@@ -248,6 +282,8 @@ def run(
             )
     if not head_pose_enabled:
         print("Using static 5-point mapping. Keep head still after calibration.")
+
+    pose_history = PoseGazeHistory()
 
     try:
         while True:
@@ -300,6 +336,8 @@ def run(
                 elif aruco_tracker is not None:
                     aruco_tracker.ready = False
                     aruco_tracker.pose_ready = False
+
+            pose_history.push(fusion_eyes, aruco_tracker)
 
             ir_calibrating = heatmap_session.calibrating
             pose_available = aruco_tracker is not None and aruco_tracker.pose_ready
@@ -414,23 +452,12 @@ def run(
                     print(message)
                     if saved and pose_mapper is not None:
                         pose_mapper.reset()
-                        print("Cattura burst 6DoF (testa ferma, marker visibili)...")
-                        gaze_by_eye = _capture_pose_burst(
-                            readers,
-                            fusion_eyes,
-                            flip_left,
-                            flip_right,
-                            mirror_left,
-                            mirror_right,
-                            front_reader,
-                            aruco_tracker,
-                        )
-                        pose_message = _record_pose_sample(
+                        pose_message = _record_pose_sample_from_history(
                             pose_mapper,
-                            aruco_tracker,
+                            pose_history,
                             heatmap_session,
                             "center",
-                            gaze_by_eye,
+                            fusion_eyes,
                         )
                         if pose_message:
                             print(pose_message)
@@ -440,6 +467,7 @@ def run(
                 _, message = heatmap_session.handle_key(key, combined_gaze)
                 if pose_mapper is not None:
                     pose_mapper.reset()
+                pose_history.clear()
                 print(message)
             elif key in (KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT):
                 edge_by_key = {
@@ -452,24 +480,13 @@ def run(
                 saved, message = calibrate_fn(calibration_gaze)
                 print(message)
                 if saved and pose_mapper is not None:
-                    print("Cattura burst 6DoF (testa ferma, marker visibili)...")
-                    gaze_by_eye = _capture_pose_burst(
-                        readers,
-                        fusion_eyes,
-                        flip_left,
-                        flip_right,
-                        mirror_left,
-                        mirror_right,
-                        front_reader,
-                        aruco_tracker,
-                    )
                     print(
-                        _record_pose_sample(
+                        _record_pose_sample_from_history(
                             pose_mapper,
-                            aruco_tracker,
+                            pose_history,
                             heatmap_session,
                             label,
-                            gaze_by_eye,
+                            fusion_eyes,
                         )
                     )
             elif key == ord("s"):
@@ -483,6 +500,7 @@ def run(
                 heatmap_session.reset_heatmap()
                 if pose_mapper is not None:
                     pose_mapper.reset()
+                pose_history.clear()
                 print("Gaze fusion: both eyes. Calibrazione resettata: premi C.")
             elif key == ord("1") and "left" in active_eyes:
                 fusion_eyes = ("left",)
@@ -491,6 +509,7 @@ def run(
                 heatmap_session.reset_heatmap()
                 if pose_mapper is not None:
                     pose_mapper.reset()
+                pose_history.clear()
                 print("Gaze fusion: LEFT eye only. Calibrazione resettata: premi C.")
             elif key == ord("2") and "right" in active_eyes:
                 fusion_eyes = ("right",)
@@ -499,6 +518,7 @@ def run(
                 heatmap_session.reset_heatmap()
                 if pose_mapper is not None:
                     pose_mapper.reset()
+                pose_history.clear()
                 print("Gaze fusion: RIGHT eye only. Calibrazione resettata: premi C.")
             else:
                 handled, message = heatmap_session.handle_key(key, combined_gaze)
