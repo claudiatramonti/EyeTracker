@@ -12,6 +12,7 @@ class CameraPanelOverlay:
     SLOT_ORDER = ("left", "right", "front")
     SLOT_LABELS = {"left": "Left IR", "right": "Right IR", "front": "Front"}
 
+    # initialise the camera panel overlay with the screen width and height
     def __init__(self, screen_width, screen_height, panel_height=None, margin=16, gap=14):
         self.screen_width = screen_width
         self.screen_height = screen_height
@@ -26,22 +27,27 @@ class CameraPanelOverlay:
         self._layout = {}
         self._cluster_bounds = None
 
+    # set the active camera slots to the given slot ids
     def set_active_slots(self, slot_ids):
         self._active_slots = [slot for slot in self.SLOT_ORDER if slot in slot_ids]
         self._rebuild_layout()
 
+    # set the frame for the given slot id
     def set_frame(self, slot_id, frame):
         if slot_id in self._frames:
             self._frames[slot_id] = None if frame is None else frame.copy()
 
+    # toggle the visibility of the camera panel
     def toggle(self):
         self.visible = not self.visible
         return self.visible
 
+    # return the status line for the camera panel in the HUD
     def status_line(self):
         state = "ON" if self.visible else "OFF"
         return f"Camera previews: {state} (V toggle)"
 
+    # rebuild the layout of the camera panel when the active slots change
     def _rebuild_layout(self):
         self._layout = {}
         self._cluster_bounds = None
@@ -69,6 +75,7 @@ class CameraPanelOverlay:
             y0 + self.panel_height + pad,
         )
 
+    # fit the frame to the given width and height
     def _fit_frame(self, frame, width, height):
         fh, fw = frame.shape[:2]
         scale = min(width / fw, height / fh)
@@ -81,6 +88,7 @@ class CameraPanelOverlay:
         canvas[offset_y : offset_y + new_h, offset_x : offset_x + new_w] = resized
         return canvas, offset_x, offset_y, new_w, new_h
 
+    # overlay the camera panel on the given frame
     def overlay_on(self, frame):
         if not self.visible or not self._active_slots:
             return frame

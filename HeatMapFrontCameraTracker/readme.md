@@ -55,6 +55,29 @@ python HeatMapFrontCameraTracker.py
 2. Enable **Flip left/right image** if a camera is mounted upside down.
 3. Click **Start**.
 
+## Front camera calibration
+
+Before using ArUco 6DoF head compensation, calibrate the front camera once.
+Print a chessboard with **10×7 squares** (therefore **9×6 internal corners**) and
+measure the side of one square. With the tracker closed, run:
+
+```bash
+python calibrate_front_camera.py CAMERA_INDEX --columns 9 --rows 6 --square-mm 25
+```
+
+Replace `CAMERA_INDEX` and `25` with your front camera index and measured square
+size. In the calibration window:
+
+1. Hold the whole chessboard visible.
+2. Press **Space** to save a view.
+3. Collect at least 12 views at different positions, distances and angles.
+4. Press **C** to calibrate and save `front_camera_calibration.npz`.
+
+Prefer 20–30 varied views. An RMS error below about 1 pixel is good; above 2
+pixels, repeat with sharper and more varied images. The main tracker loads this
+file automatically. The HUD reports either `Front calibrata RMS ...` or
+`Front intrinseci stimati`.
+
 ## Windows
 
 | Window | Description |
@@ -78,7 +101,11 @@ Calibrate on the **Gaze Heatmap** window while looking at the matching spot on y
 | 4 | **←** | Look at the left target |
 | 5 | **→** | Look at the right target |
 
-Recording starts after all five points are valid. With a front camera selected, keep at least two ArUco markers visible while saving every point. The HUD shows `Gaze 6DoF: pronto` when head compensation is calibrated.
+Recording starts after all five points are valid. With a calibrated front camera
+and visible ArUco markers, the same keys also build a per-eye 6DoF head map
+(multi-frame burst per key). Keep your head still while pressing each key; after
+`Gaze 6DoF: pronto`, normal head movement is compensated. Without front
+calibration / markers, the five-point map stays static.
 
 ### Other keys (heatmap window)
 
@@ -130,7 +157,7 @@ This is the same *idea* as the combined gaze sphere in Unity stereo mode, but ma
 ## Tips
 
 - Keep the glasses still while pressing each calibration key; after `Gaze 6DoF: pronto`, normal head movement is compensated.
-- Keep all four markers visible when possible; two are the minimum for pose estimation.
+- Keep all four markers visible when possible; three are the minimum for pose estimation.
 - For heatmap-only use, set **Front camera** to `None`.
 - Camera indices depend on USB order; use the GUI dropdowns to assign left, right, and front correctly.
 
@@ -178,13 +205,11 @@ Run `HeatMapFrontCameraTracker.py` with **Front camera** enabled. The window **E
 
 ### Phase 3 — 6DoF head compensation (integrated)
 
-When **Front camera** is enabled:
+Requires **Front camera** plus `front_camera_calibration.npz` (see above):
 
-1. `solvePnP` estimates the screen-to-front-camera rotation and translation from the marker corners.
-2. The five calibration targets estimate the fixed IR-gaze-to-front-camera rotation.
-3. Every gaze ray is transformed into the current front-camera frame.
-4. The ray is intersected with the current screen plane, compensating glasses/head rotation and translation.
+1. Filtered `solvePnP` estimates the screen-to-front-camera pose from ≥3 marker corners.
+2. Each calibration key captures a short multi-frame burst of **per-eye** IR gaze and stores independent IR↔front extrinsics.
+3. At runtime each calibrated eye is projected to the screen plane; pixel results are averaged.
+4. If markers are briefly lost, the app falls back to the static five-point map until pose returns.
 
-Complete **C + ↑ + ↓ + ← + →** while at least two markers are visible. Four visible markers give the most stable pose. Once calibrated, the HUD shows `Mapping: ArUco 6DoF (compensazione testa)`.
-
-If marker pose is temporarily lost after 6DoF calibration, recording pauses instead of writing incorrect heatmap points. Without a front camera, the same five points provide a static piecewise mapping.
+Complete **C + ↑ + ↓ + ← + →** with head still and markers visible. HUD then shows `Mapping: ArUco 6DoF per-occhio`. Without front calibration, 6DoF stays OFF and only the static map is used.

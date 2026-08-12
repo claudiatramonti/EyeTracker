@@ -30,6 +30,10 @@ CORNER_MARKER_IDS = {
 }
 
 DEFAULT_MARKER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aruco_markers")
+DEFAULT_CAMERA_CALIBRATION_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "front_camera_calibration.npz",
+)
 CORNER_WINDOW_NAME = "ArUco Screen Corners"
 
 # On-screen corner markers: ~20% of shorter screen edge (min 180px, max 480px).
@@ -38,8 +42,12 @@ MARKER_SIZE_MIN = 180
 MARKER_SIZE_MAX = 480
 MARKER_SOURCE_SIDE = 320
 MARKER_SOURCE_BORDER = 24
-MIN_POSE_MARKERS = 2
-MAX_POSE_REPROJECTION_ERROR_PX = 12.0
+MIN_POSE_MARKERS = 3
+MAX_POSE_REPROJECTION_ERROR_PX = 10.0
+POSE_SMOOTH_ALPHA = 0.28
+CALIBRATION_BURST_FRAMES = 18
+MAX_GAZE_POSE_ANGULAR_RMS_DEG = 8.0
+MAX_EYE_ORIGIN_NORM = 600.0
 
 
 def marker_center(corners_entry):
@@ -65,6 +73,52 @@ def default_camera_matrix(width, height, fx=600.0, fy=600.0, cx=None, cy=None):
         [[float(fx), 0.0, cx], [0.0, float(fy), cy], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
+
+
+def load_camera_calibration(
+    path=DEFAULT_CAMERA_CALIBRATION_PATH,
+    target_width=None,
+    target_height=None,
+):
+    """Load calibrated intrinsics and scale them to the current resolution."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with np.load(path) as data:
+            camera_matrix = np.asarray(data["camera_matrix"], dtype=np.float64)
+            distortion = np.asarray(
+                data["distortion_coefficients"],
+                dtype=np.float64,
+            )
+            source_width = int(data["image_width"])
+            source_height = int(data["image_height"])
+            rms_error = float(data["rms_error"])
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+    if (
+        camera_matrix.shape != (3, 3)
+        or source_width <= 0
+        or source_height <= 0
+        or not np.all(np.isfinite(camera_matrix))
+        or not np.all(np.isfinite(distortion))
+    ):
+        return None
+
+    target_width = source_width if target_width is None else int(target_width)
+    target_height = source_height if target_height is None else int(target_height)
+    scaled_matrix = camera_matrix.copy()
+    scaled_matrix[0, :] *= target_width / source_width
+    scaled_matrix[1, :] *= target_height / source_height
+    scaled_matrix[2, :] = camera_matrix[2, :]
+    return {
+        "camera_matrix": scaled_matrix,
+        "distortion_coefficients": distortion,
+        "source_size": (source_width, source_height),
+        "target_size": (target_width, target_height),
+        "rms_error": rms_error,
+        "path": path,
+    }
 
 
 def screen_marker_code_corners(screen_width, screen_height, marker_size, margin):
@@ -278,6 +332,7 @@ class ArucoScreenTracker:
         cam_cx=None,
         cam_cy=None,
         distortion_coefficients=None,
+        camera_calibration_path=DEFAULT_CAMERA_CALIBRATION_PATH,
     ):
         self.screen_width = screen_width
         self.screen_height = screen_height
@@ -293,19 +348,39 @@ class ArucoScreenTracker:
             self.marker_size,
             marker_margin,
         )
-        self.camera_matrix = default_camera_matrix(
-            cam_width,
-            cam_height,
-            fx=cam_fx,
-            fy=cam_fy,
-            cx=cam_cx,
-            cy=cam_cy,
-        )
-        self.distortion_coefficients = (
-            np.zeros((5, 1), dtype=np.float64)
+        self.camera_calibration_path = camera_calibration_path
+        self.camera_calibrated = False
+        self.camera_calibration_rms = None
+        loaded_calibration = (
+            load_camera_calibration(
+                camera_calibration_path,
+                target_width=cam_width,
+                target_height=cam_height,
+            )
             if distortion_coefficients is None
-            else np.asarray(distortion_coefficients, dtype=np.float64)
+            else None
         )
+        if loaded_calibration is not None:
+            self.camera_matrix = loaded_calibration["camera_matrix"]
+            self.distortion_coefficients = loaded_calibration[
+                "distortion_coefficients"
+            ]
+            self.camera_calibrated = True
+            self.camera_calibration_rms = loaded_calibration["rms_error"]
+        else:
+            self.camera_matrix = default_camera_matrix(
+                cam_width,
+                cam_height,
+                fx=cam_fx,
+                fy=cam_fy,
+                cx=cam_cx,
+                cy=cam_cy,
+            )
+            self.distortion_coefficients = (
+                np.zeros((5, 1), dtype=np.float64)
+                if distortion_coefficients is None
+                else np.asarray(distortion_coefficients, dtype=np.float64)
+            )
         self.homography = None
         self.markers_found = 0
         self.corner_ids_found = set()
@@ -316,6 +391,8 @@ class ArucoScreenTracker:
         self.pose_reprojection_error = None
         self.pose_marker_ids = set()
         self.pose_timestamp = None
+        self._raw_pose_rotation = None
+        self._raw_pose_translation = None
 
     def configure_camera(
         self,
@@ -326,6 +403,19 @@ class ArucoScreenTracker:
         cx=None,
         cy=None,
     ):
+        if self.camera_calibrated:
+            calibration = load_camera_calibration(
+                self.camera_calibration_path,
+                target_width=width,
+                target_height=height,
+            )
+            if calibration is not None:
+                self.camera_matrix = calibration["camera_matrix"]
+                self.distortion_coefficients = calibration[
+                    "distortion_coefficients"
+                ]
+                self.camera_calibration_rms = calibration["rms_error"]
+                return
         self.camera_matrix = default_camera_matrix(
             width,
             height,
@@ -395,15 +485,38 @@ class ArucoScreenTracker:
                 self.distortion_coefficients,
             )
             if pose is not None:
-                self.pose_rotation = pose["rotation"]
-                self.pose_translation = pose["translation"]
-                self.pose_reprojection_error = pose["reprojection_error"]
-                self.pose_marker_ids = pose["marker_ids"]
-                self.pose_timestamp = time.perf_counter()
-                self.pose_ready = True
+                self._update_smoothed_pose(pose)
 
         self._draw_status(out)
         return out
+
+    def _update_smoothed_pose(self, pose):
+        """Blend the latest solvePnP pose to reduce frame-to-frame jitter."""
+        rotation = pose["rotation"]
+        translation = pose["translation"]
+        self._raw_pose_rotation = rotation
+        self._raw_pose_translation = translation
+
+        if self.pose_rotation is None or self.pose_translation is None:
+            self.pose_rotation = rotation.copy()
+            self.pose_translation = translation.copy()
+        else:
+            alpha = POSE_SMOOTH_ALPHA
+            blended = (1.0 - alpha) * self.pose_rotation + alpha * rotation
+            u, _, vt = np.linalg.svd(blended)
+            smoothed = u @ vt
+            if np.linalg.det(smoothed) < 0.0:
+                u[:, -1] *= -1.0
+                smoothed = u @ vt
+            self.pose_rotation = smoothed
+            self.pose_translation = (
+                (1.0 - alpha) * self.pose_translation + alpha * translation
+            )
+
+        self.pose_reprojection_error = pose["reprojection_error"]
+        self.pose_marker_ids = pose["marker_ids"]
+        self.pose_timestamp = time.perf_counter()
+        self.pose_ready = True
 
     def screen_point_in_camera(self, u, v):
         """Direction from front camera origin to one screen point."""
@@ -487,182 +600,281 @@ class ArucoScreenTracker:
         cv2.putText(frame, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
 
     def status_line(self):
+        calibration_status = (
+            f"calibrata RMS {self.camera_calibration_rms:.2f}px"
+            if self.camera_calibrated
+            else "intrinseci stimati"
+        )
         if self.pose_ready:
             return (
                 f"ArUco pose: OK ({len(self.pose_marker_ids)}/4, "
-                f"err {self.pose_reprojection_error:.1f}px)"
+                f"err {self.pose_reprojection_error:.1f}px) | Front {calibration_status}"
             )
         if self.ready:
-            return "ArUco homography: OK, pose unavailable"
+            return f"ArUco homography: OK, pose unavailable | Front {calibration_status}"
         if self.corner_ids_found:
-            return f"ArUco: {len(self.corner_ids_found)}/4 corners"
+            return (
+                f"ArUco: {len(self.corner_ids_found)}/4 corners | "
+                f"Front {calibration_status}"
+            )
         if self.markers_found:
-            return f"ArUco: {self.markers_found} marker(s)"
-        return "ArUco: none"
+            return f"ArUco: {self.markers_found} marker(s) | Front {calibration_status}"
+        return f"ArUco: none | Front {calibration_status}"
 
 
 class GazePoseMapper:
     """
-    Calibrate the fixed rotation from IR-gaze coordinates to front-camera coordinates.
+    Per-eye fixed transform from IR gaze space into the front-camera frame.
 
-    Each five-point sample pairs an IR gaze direction with the direction from the
-    front camera to that known screen target. At runtime the current ArUco pose
-    converts the rotated gaze ray into an intersection with the screen plane.
+    Each calibration label stores independent samples for every available eye.
+    At runtime each calibrated eye is projected to the screen and the pixel
+    results are averaged. This avoids fusing incompatible eye rays first.
     """
 
     REQUIRED_LABELS = frozenset(("center", "top", "bottom", "left", "right"))
 
-    def __init__(self):
-        self.samples = {}
+    def __init__(self, eye_ids=("left", "right")):
+        self.eye_ids = tuple(eye_ids)
+        self.samples = {eye_id: {} for eye_id in self.eye_ids}
+        self.extrinsics = {}
+        self.angular_rms_deg = None
         self.rotation_gaze_to_camera = None
         self.origin_gaze_in_camera = np.zeros(3, dtype=np.float64)
-        self.angular_rms_deg = None
 
     @property
     def calibrated(self):
-        return (
-            self.rotation_gaze_to_camera is not None
-            and self.REQUIRED_LABELS.issubset(self.samples)
-        )
+        return bool(self.extrinsics)
+
+    def calibrated_eyes(self):
+        return tuple(self.extrinsics.keys())
 
     def reset(self):
-        self.samples = {}
+        self.samples = {eye_id: {} for eye_id in self.eye_ids}
+        self.extrinsics = {}
+        self.angular_rms_deg = None
         self.rotation_gaze_to_camera = None
         self.origin_gaze_in_camera = np.zeros(3, dtype=np.float64)
-        self.angular_rms_deg = None
+
+    def _fit_eye_extrinsics(self, eye_samples):
+        ordered = sorted(self.REQUIRED_LABELS)
+        gaze_rows = np.asarray(
+            [eye_samples[name][0] for name in ordered],
+            dtype=np.float64,
+        )
+        target_positions = np.asarray(
+            [eye_samples[name][1] for name in ordered],
+            dtype=np.float64,
+        )
+        target_norms = np.linalg.norm(target_positions, axis=1)
+        if np.any(target_norms < 1e-9):
+            return None, None, None
+
+        target_rows = target_positions / target_norms[:, None]
+        try:
+            u, _, vt = np.linalg.svd(gaze_rows.T @ target_rows)
+        except np.linalg.LinAlgError:
+            return None, None, None
+        rotation = vt.T @ u.T
+        if np.linalg.det(rotation) < 0.0:
+            vt[-1, :] *= -1.0
+            rotation = vt.T @ u.T
+
+        origin = np.zeros(3, dtype=np.float64)
+        if np.all(gaze_rows[:, 2] > 1e-6):
+            ideal_image_points = gaze_rows[:, :2] / gaze_rows[:, 2, None]
+            try:
+                pnp_ok, rvec, tvec = cv2.solvePnP(
+                    target_positions,
+                    ideal_image_points,
+                    np.eye(3, dtype=np.float64),
+                    np.zeros((5, 1), dtype=np.float64),
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+            except cv2.error:
+                pnp_ok = False
+            if pnp_ok:
+                rotation_camera_to_gaze, _ = cv2.Rodrigues(rvec)
+                estimated_rotation = rotation_camera_to_gaze.T
+                estimated_origin = -estimated_rotation @ tvec.reshape(3)
+                if (
+                    np.all(np.isfinite(estimated_origin))
+                    and np.linalg.det(estimated_rotation) > 0.0
+                    and np.linalg.norm(estimated_origin) <= MAX_EYE_ORIGIN_NORM
+                    and -MAX_EYE_ORIGIN_NORM <= estimated_origin[2] <= 400.0
+                ):
+                    rotation = estimated_rotation
+                    origin = estimated_origin
+
+        target_rows = target_positions - origin
+        target_row_norms = np.linalg.norm(target_rows, axis=1)
+        if np.any(target_row_norms < 1e-9):
+            return None, None, None
+        target_rows = target_rows / target_row_norms[:, None]
+        predicted = (rotation @ gaze_rows.T).T
+        dots = np.clip(np.sum(predicted * target_rows, axis=1), -1.0, 1.0)
+        angular_errors = np.degrees(np.arccos(dots))
+        angular_rms = float(np.sqrt(np.mean(angular_errors * angular_errors)))
+        if not np.isfinite(angular_rms) or angular_rms > MAX_GAZE_POSE_ANGULAR_RMS_DEG:
+            return None, None, angular_rms
+        return rotation, origin, angular_rms
 
     def add_calibration_sample(
         self,
         label,
-        gaze_direction,
+        gaze_by_eye,
         screen_point,
         screen_tracker,
     ):
         if label not in self.REQUIRED_LABELS:
             return False, f"Etichetta posa non valida: {label}"
         if screen_tracker is None or not screen_tracker.pose_ready:
-            return False, "Posa 6DoF non salvata: servono almeno 2 marker ArUco visibili."
+            return False, "Posa 6DoF non salvata: servono almeno 3 marker ArUco."
 
-        gaze = np.asarray(gaze_direction, dtype=np.float64)
-        gaze_norm = np.linalg.norm(gaze)
-        if gaze.shape != (3,) or not np.all(np.isfinite(gaze)) or gaze_norm < 1e-9:
-            return False, "Posa 6DoF non salvata: vettore gaze non valido."
-        gaze = gaze / gaze_norm
+        if not isinstance(gaze_by_eye, dict):
+            gaze_by_eye = {"combined": np.asarray(gaze_by_eye, dtype=np.float64)}
+            if "combined" not in self.samples:
+                self.samples["combined"] = {}
+                self.eye_ids = tuple(dict.fromkeys(self.eye_ids + ("combined",)))
 
         target_position = screen_tracker.screen_point_position_in_camera(*screen_point)
         if target_position is None:
             return False, "Posa 6DoF non salvata: target schermo non proiettabile."
 
-        candidate_samples = dict(self.samples)
-        candidate_samples[label] = (gaze, target_position)
-        candidate_rotation = self.rotation_gaze_to_camera
-        candidate_origin = self.origin_gaze_in_camera.copy()
-        candidate_error = self.angular_rms_deg
+        saved_eyes = []
+        for eye_id, gaze_direction in gaze_by_eye.items():
+            gaze = np.asarray(gaze_direction, dtype=np.float64)
+            gaze_norm = np.linalg.norm(gaze)
+            if gaze.shape != (3,) or not np.all(np.isfinite(gaze)) or gaze_norm < 1e-9:
+                continue
+            if eye_id not in self.samples:
+                self.samples[eye_id] = {}
+            self.samples[eye_id][label] = (gaze / gaze_norm, target_position.copy())
+            saved_eyes.append(eye_id)
 
-        if self.REQUIRED_LABELS.issubset(candidate_samples):
-            ordered = sorted(self.REQUIRED_LABELS)
-            gaze_rows = np.asarray(
-                [candidate_samples[name][0] for name in ordered],
-                dtype=np.float64,
-            )
-            target_positions = np.asarray(
-                [candidate_samples[name][1] for name in ordered],
-                dtype=np.float64,
-            )
-            target_norms = np.linalg.norm(target_positions, axis=1)
-            if np.any(target_norms < 1e-9):
-                return False, "Calibrazione posa 6DoF degenerata."
-            target_rows = target_positions / target_norms[:, None]
-            covariance = gaze_rows.T @ target_rows
-            try:
-                u, _, vt = np.linalg.svd(covariance)
-            except np.linalg.LinAlgError:
-                return False, "Calibrazione posa 6DoF degenerata."
-            candidate_rotation = vt.T @ u.T
-            if np.linalg.det(candidate_rotation) < 0.0:
-                vt[-1, :] *= -1.0
-                candidate_rotation = vt.T @ u.T
+        if not saved_eyes:
+            return False, "Posa 6DoF non salvata: nessun vettore occhio valido."
 
-            # Treat normalized gaze rays as ideal pinhole image coordinates.
-            # solvePnP then recovers the rigid gaze-frame pose inside the fixed
-            # front-camera frame, including the physical eye/camera offset.
-            candidate_origin = np.zeros(3, dtype=np.float64)
-            if np.all(gaze_rows[:, 2] > 1e-6):
-                ideal_image_points = gaze_rows[:, :2] / gaze_rows[:, 2, None]
-                try:
-                    pnp_ok, rotation_camera_to_gaze_vec, translation_camera_to_gaze = (
-                        cv2.solvePnP(
-                            target_positions,
-                            ideal_image_points,
-                            np.eye(3, dtype=np.float64),
-                            np.zeros((5, 1), dtype=np.float64),
-                            flags=cv2.SOLVEPNP_ITERATIVE,
-                        )
+        candidate_extrinsics = dict(self.extrinsics)
+        rms_values = []
+        for eye_id, eye_samples in self.samples.items():
+            if not self.REQUIRED_LABELS.issubset(eye_samples):
+                continue
+            rotation, origin, angular_rms = self._fit_eye_extrinsics(eye_samples)
+            if rotation is None or origin is None:
+                if angular_rms is not None:
+                    return (
+                        False,
+                        f"Calibrazione {eye_id} incoerente ({angular_rms:.1f}° RMS): "
+                        "ripeti C e i bordi a testa ferma con marker visibili.",
                     )
-                except cv2.error:
-                    pnp_ok = False
+                return False, f"Calibrazione {eye_id} degenerata."
+            candidate_extrinsics[eye_id] = {
+                "rotation": rotation,
+                "origin": origin,
+                "angular_rms_deg": angular_rms,
+            }
+            rms_values.append(angular_rms)
 
-                if pnp_ok:
-                    rotation_camera_to_gaze, _ = cv2.Rodrigues(
-                        rotation_camera_to_gaze_vec
-                    )
-                    estimated_rotation = rotation_camera_to_gaze.T
-                    estimated_origin = -estimated_rotation @ (
-                        translation_camera_to_gaze.reshape(3)
-                    )
-                    if (
-                        np.all(np.isfinite(estimated_origin))
-                        and np.linalg.det(estimated_rotation) > 0.0
-                        and np.linalg.norm(estimated_origin) <= 800.0
-                        and -800.0 <= estimated_origin[2] <= 400.0
-                    ):
-                        candidate_rotation = estimated_rotation
-                        candidate_origin = estimated_origin
-
-            target_rows = target_positions - candidate_origin
-            target_row_norms = np.linalg.norm(target_rows, axis=1)
-            if np.any(target_row_norms < 1e-9):
-                return False, "Calibrazione posa 6DoF degenerata."
-            target_rows = target_rows / target_row_norms[:, None]
-
-            predicted = (candidate_rotation @ gaze_rows.T).T
-            dots = np.clip(np.sum(predicted * target_rows, axis=1), -1.0, 1.0)
-            angular_errors = np.degrees(np.arccos(dots))
-            candidate_error = float(np.sqrt(np.mean(angular_errors * angular_errors)))
-            if not np.isfinite(candidate_error) or candidate_error > 15.0:
-                return (
-                    False,
-                    f"Calibrazione posa incoerente ({candidate_error:.1f}° RMS): "
-                    "ripeti C e i quattro bordi senza muovere gli occhiali.",
-                )
-
-        self.samples = candidate_samples
-        self.rotation_gaze_to_camera = candidate_rotation
-        self.origin_gaze_in_camera = candidate_origin
-        self.angular_rms_deg = candidate_error
-        count = len(self.REQUIRED_LABELS.intersection(self.samples))
-        if self.calibrated:
-            return True, f"Posa gaze 6DoF pronta ({self.angular_rms_deg:.1f}° RMS)."
-        return True, f"Campione posa 6DoF {label} salvato ({count}/5)."
-
-    def project(self, gaze_direction, screen_tracker):
-        if not self.calibrated or screen_tracker is None or not screen_tracker.pose_ready:
-            return None
-        gaze = np.asarray(gaze_direction, dtype=np.float64)
-        norm = np.linalg.norm(gaze)
-        if gaze.shape != (3,) or not np.all(np.isfinite(gaze)) or norm < 1e-9:
-            return None
-        direction_camera = self.rotation_gaze_to_camera @ (gaze / norm)
-        return screen_tracker.project_camera_ray_to_screen(
-            direction_camera,
-            origin_camera=self.origin_gaze_in_camera,
+        self.extrinsics = candidate_extrinsics
+        self.angular_rms_deg = (
+            float(np.mean(rms_values)) if rms_values else None
         )
 
-    def status_line(self):
-        count = len(self.REQUIRED_LABELS.intersection(self.samples))
+        # Compatibility aliases for older callers/tests.
+        if "combined" in self.extrinsics:
+            only = self.extrinsics["combined"]
+            self.rotation_gaze_to_camera = only["rotation"]
+            self.origin_gaze_in_camera = only["origin"]
+        elif len(self.extrinsics) == 1:
+            only = next(iter(self.extrinsics.values()))
+            self.rotation_gaze_to_camera = only["rotation"]
+            self.origin_gaze_in_camera = only["origin"]
+        else:
+            self.rotation_gaze_to_camera = None
+            self.origin_gaze_in_camera = np.zeros(3, dtype=np.float64)
+
+        ready_count = min(
+            len(self.REQUIRED_LABELS.intersection(samples))
+            for samples in self.samples.values()
+            if samples
+        ) if any(self.samples.values()) else 0
         if self.calibrated:
-            return f"Gaze 6DoF: pronto ({self.angular_rms_deg:.1f}° RMS)"
+            eyes = ",".join(self.calibrated_eyes())
+            return (
+                True,
+                f"Posa gaze 6DoF pronta ({self.angular_rms_deg:.1f}° RMS, occhi: {eyes}).",
+            )
+        return True, f"Campione posa 6DoF {label} salvato ({ready_count}/5)."
+
+    def project(self, gaze_direction_or_by_eye, screen_tracker):
+        if not self.calibrated or screen_tracker is None or not screen_tracker.pose_ready:
+            return None
+
+        if isinstance(gaze_direction_or_by_eye, dict):
+            gaze_by_eye = gaze_direction_or_by_eye
+        else:
+            if "combined" in self.extrinsics:
+                gaze_by_eye = {"combined": gaze_direction_or_by_eye}
+            elif len(self.extrinsics) == 1:
+                only_eye = next(iter(self.extrinsics))
+                gaze_by_eye = {only_eye: gaze_direction_or_by_eye}
+            else:
+                return None
+
+        points = []
+        for eye_id, extrinsic in self.extrinsics.items():
+            gaze = gaze_by_eye.get(eye_id)
+            if gaze is None:
+                continue
+            gaze = np.asarray(gaze, dtype=np.float64)
+            norm = np.linalg.norm(gaze)
+            if gaze.shape != (3,) or not np.all(np.isfinite(gaze)) or norm < 1e-9:
+                continue
+            direction_camera = extrinsic["rotation"] @ (gaze / norm)
+            point = screen_tracker.project_camera_ray_to_screen(
+                direction_camera,
+                origin_camera=extrinsic["origin"],
+            )
+            if point is not None:
+                points.append(point)
+
+        if not points:
+            return None
+        mean_u = float(np.mean([point[0] for point in points]))
+        mean_v = float(np.mean([point[1] for point in points]))
+        return int(round(mean_u)), int(round(mean_v))
+
+    def status_line(self):
+        if self.calibrated:
+            eyes = ",".join(self.calibrated_eyes())
+            return f"Gaze 6DoF: pronto ({self.angular_rms_deg:.1f}° RMS, {eyes})"
+        counts = [
+            len(self.REQUIRED_LABELS.intersection(samples))
+            for samples in self.samples.values()
+            if samples
+        ]
+        count = min(counts) if counts else 0
         return f"Gaze 6DoF: calibrazione {count}/5"
+
+
+def average_unit_directions(directions):
+    """Average finite unit directions; returns None if empty."""
+    valid = []
+    for direction in directions:
+        if direction is None:
+            continue
+        vector = np.asarray(direction, dtype=np.float64)
+        norm = np.linalg.norm(vector)
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)) or norm < 1e-9:
+            continue
+        valid.append(vector / norm)
+    if not valid:
+        return None
+    combined = np.sum(valid, axis=0)
+    norm = np.linalg.norm(combined)
+    if norm < 1e-9:
+        return valid[0]
+    return combined / norm
 
 
 def gaze_to_front_camera_pixels(

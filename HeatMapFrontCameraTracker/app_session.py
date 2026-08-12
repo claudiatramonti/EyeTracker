@@ -15,6 +15,10 @@ from input_poll import KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_UP, poll_control_key
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Prefer head-pose mapping when the front camera has real intrinsics and the
+# per-eye 6DoF calibration succeeds. Otherwise keep the static 5-point map.
+ENABLE_HEAD_POSE_MAPPING = True
+
 
 def _format_fusion_status(fusion_eyes, active_eyes):
     if fusion_eyes == active_eyes or set(fusion_eyes) == set(active_eyes):
@@ -26,9 +30,61 @@ def _format_fusion_status(fusion_eyes, active_eyes):
     return f"Gaze: {','.join(fusion_eyes)}"
 
 
-def _record_pose_sample(pose_mapper, aruco_tracker, heatmap_session, label, gaze_direction):
+def _current_eye_gazes(eye_ids):
+    gazes = {}
+    for eye_id in eye_ids:
+        direction = eye_tracker.get_eye_gaze_dir(eye_id)
+        if direction is not None:
+            gazes[eye_id] = direction
+    return gazes
+
+
+def _capture_pose_burst(readers, eye_ids, flip_left, flip_right, mirror_left, mirror_right, front_reader, aruco_tracker, frames=None):
+    """Average several frames of per-eye gaze while ArUco pose stays available."""
+    frames = aruco_screen.CALIBRATION_BURST_FRAMES if frames is None else frames
+    samples = {eye_id: [] for eye_id in eye_ids}
+    for _ in range(frames):
+        for eye_id, reader in readers.items():
+            if eye_id not in eye_ids:
+                continue
+            ret, frame = reader.read()
+            if not ret:
+                continue
+            flip_v = flip_left if eye_id == "left" else flip_right
+            mirror = mirror_left if eye_id == "left" else mirror_right
+            eye_tracker.process_frame(
+                frame,
+                eye_id=eye_id,
+                flip_vertical=flip_v,
+                flip_horizontal=mirror,
+            )
+
+        if front_reader is not None and aruco_tracker is not None:
+            ret_ext, ext_frame = front_reader.read()
+            if ret_ext:
+                aruco_tracker.process(ext_frame)
+
+        if aruco_tracker is None or not aruco_tracker.pose_ready:
+            continue
+        for eye_id in eye_ids:
+            direction = eye_tracker.get_eye_gaze_dir(eye_id)
+            if direction is not None:
+                samples[eye_id].append(direction)
+        time.sleep(0.01)
+
+    averaged = {}
+    for eye_id, directions in samples.items():
+        average = aruco_screen.average_unit_directions(directions)
+        if average is not None:
+            averaged[eye_id] = average
+    return averaged
+
+
+def _record_pose_sample(pose_mapper, aruco_tracker, heatmap_session, label, gaze_by_eye):
     if pose_mapper is None:
-        return "Posa 6DoF non attiva: front camera disabilitata."
+        return "Posa 6DoF non attiva."
+    if not gaze_by_eye:
+        return "Posa 6DoF non salvata: burst IR vuoto (tieni i marker visibili)."
     if label == "center":
         target = (heatmap_session.cx, heatmap_session.cy)
     else:
@@ -38,7 +94,7 @@ def _record_pose_sample(pose_mapper, aruco_tracker, heatmap_session, label, gaze
         )[label]
     _, message = pose_mapper.add_calibration_sample(
         label,
-        gaze_direction,
+        gaze_by_eye,
         target,
         aruco_tracker,
     )
@@ -168,7 +224,30 @@ def run(
         if front_reader
         else None
     )
-    pose_mapper = aruco_screen.GazePoseMapper() if aruco_tracker is not None else None
+    pose_mapper = None
+    head_pose_enabled = False
+    if aruco_tracker is not None:
+        if aruco_tracker.camera_calibrated:
+            print(
+                "Front camera calibration loaded "
+                f"(RMS {aruco_tracker.camera_calibration_rms:.3f}px)."
+            )
+            if ENABLE_HEAD_POSE_MAPPING:
+                pose_mapper = aruco_screen.GazePoseMapper(eye_ids=active_eyes)
+                head_pose_enabled = True
+                print(
+                    "Head compensation 6DoF: ON (per-eye, multi-frame). "
+                    "Keep head still while pressing C and arrow keys."
+                )
+            else:
+                print("Head compensation 6DoF: OFF by flag.")
+        else:
+            print(
+                "Front camera not calibrated: 6DoF stays OFF. "
+                "Run calibrate_front_camera.py, then retry."
+            )
+    if not head_pose_enabled:
+        print("Using static 5-point mapping. Keep head still after calibration.")
 
     try:
         while True:
@@ -226,28 +305,22 @@ def run(
             pose_available = aruco_tracker is not None and aruco_tracker.pose_ready
             pose_calibrated = pose_mapper is not None and pose_mapper.calibrated
             use_pose_mapping = (
-                heatmap_session.mapping_ready
+                head_pose_enabled
+                and heatmap_session.mapping_ready
                 and pose_calibrated
                 and pose_available
             )
-            pose_tracking_lost = (
-                heatmap_session.mapping_ready
-                and pose_calibrated
-                and not pose_available
-            )
-            use_calibrated_mapping = (
-                heatmap_session.mapping_ready
-                and not pose_calibrated
-            )
+            use_calibrated_mapping = heatmap_session.mapping_ready and not use_pose_mapping
             aruco_available = aruco_tracker is not None and aruco_tracker.ready
 
             if use_pose_mapping:
-                pose_point = pose_mapper.project(combined_gaze, aruco_tracker)
-                heatmap_session.update_screen_point(pose_point)
-            elif pose_tracking_lost:
-                # Never fall back to a head-fixed mapping after 6DoF calibration:
-                # stale marker pose would write confidently wrong heatmap points.
-                heatmap_session.update_screen_point(None)
+                gaze_by_eye = _current_eye_gazes(fusion_eyes)
+                pose_point = pose_mapper.project(gaze_by_eye, aruco_tracker)
+                if pose_point is not None:
+                    heatmap_session.update_screen_point(pose_point)
+                else:
+                    # Prefer static fallback over writing nothing / freezing.
+                    heatmap_session.update(combined_gaze)
             else:
                 heatmap_session.update(combined_gaze)
             now = time.perf_counter()
@@ -261,12 +334,12 @@ def run(
             hud_extra_lines = []
             if use_pose_mapping:
                 hud_extra_lines.append(
-                    f"Mapping: ArUco 6DoF (compensazione testa) | "
+                    f"Mapping: ArUco 6DoF per-occhio | "
                     f"{_format_fusion_status(fusion_eyes, active_eyes)}"
                 )
-            elif pose_tracking_lost:
+            elif pose_calibrated and not pose_available:
                 hud_extra_lines.append(
-                    "Mapping: 6DoF IN PAUSA - mostra almeno 2 marker ArUco"
+                    "Mapping: 6DoF fallback statico (marker non visibili)"
                 )
             elif use_calibrated_mapping:
                 hud_extra_lines.append(
@@ -280,13 +353,15 @@ def run(
                 )
             elif heatmap_session.ready:
                 hud_extra_lines.append(f"Mapping: 5 punti | {_format_fusion_status(fusion_eyes, active_eyes)}")
-            elif pose_available:
+            else:
                 hud_extra_lines.append(
-                    f"Mapping: premi C per calibrazione IR + posa 6DoF | "
+                    f"Mapping: premi C + frecce | "
                     f"{_format_fusion_status(fusion_eyes, active_eyes)}"
                 )
+            if head_pose_enabled:
+                hud_extra_lines.append("Compensazione testa 6DoF: ON (per-occhio)")
             else:
-                hud_extra_lines.append(_format_fusion_status(fusion_eyes, active_eyes))
+                hud_extra_lines.append("Compensazione testa 6DoF: OFF")
             hud_extra_lines.append(camera_panel.status_line())
             if show_corner_overlay:
                 hud_extra_lines.append(corner_markers.status_line())
@@ -339,12 +414,23 @@ def run(
                     print(message)
                     if saved and pose_mapper is not None:
                         pose_mapper.reset()
+                        print("Cattura burst 6DoF (testa ferma, marker visibili)...")
+                        gaze_by_eye = _capture_pose_burst(
+                            readers,
+                            fusion_eyes,
+                            flip_left,
+                            flip_right,
+                            mirror_left,
+                            mirror_right,
+                            front_reader,
+                            aruco_tracker,
+                        )
                         pose_message = _record_pose_sample(
                             pose_mapper,
                             aruco_tracker,
                             heatmap_session,
                             "center",
-                            calibration_gaze,
+                            gaze_by_eye,
                         )
                         if pose_message:
                             print(pose_message)
@@ -355,40 +441,35 @@ def run(
                 if pose_mapper is not None:
                     pose_mapper.reset()
                 print(message)
-            elif key == KEY_UP:
-                saved, message = heatmap_session.calibrate_top(calibration_gaze)
+            elif key in (KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT):
+                edge_by_key = {
+                    KEY_UP: ("top", heatmap_session.calibrate_top),
+                    KEY_DOWN: ("bottom", heatmap_session.calibrate_bottom),
+                    KEY_LEFT: ("left", heatmap_session.calibrate_left),
+                    KEY_RIGHT: ("right", heatmap_session.calibrate_right),
+                }
+                label, calibrate_fn = edge_by_key[key]
+                saved, message = calibrate_fn(calibration_gaze)
                 print(message)
-                if saved:
-                    print(
-                        _record_pose_sample(
-                            pose_mapper, aruco_tracker, heatmap_session, "top", calibration_gaze
-                        )
+                if saved and pose_mapper is not None:
+                    print("Cattura burst 6DoF (testa ferma, marker visibili)...")
+                    gaze_by_eye = _capture_pose_burst(
+                        readers,
+                        fusion_eyes,
+                        flip_left,
+                        flip_right,
+                        mirror_left,
+                        mirror_right,
+                        front_reader,
+                        aruco_tracker,
                     )
-            elif key == KEY_DOWN:
-                saved, message = heatmap_session.calibrate_bottom(calibration_gaze)
-                print(message)
-                if saved:
                     print(
                         _record_pose_sample(
-                            pose_mapper, aruco_tracker, heatmap_session, "bottom", calibration_gaze
-                        )
-                    )
-            elif key == KEY_LEFT:
-                saved, message = heatmap_session.calibrate_left(calibration_gaze)
-                print(message)
-                if saved:
-                    print(
-                        _record_pose_sample(
-                            pose_mapper, aruco_tracker, heatmap_session, "left", calibration_gaze
-                        )
-                    )
-            elif key == KEY_RIGHT:
-                saved, message = heatmap_session.calibrate_right(calibration_gaze)
-                print(message)
-                if saved:
-                    print(
-                        _record_pose_sample(
-                            pose_mapper, aruco_tracker, heatmap_session, "right", calibration_gaze
+                            pose_mapper,
+                            aruco_tracker,
+                            heatmap_session,
+                            label,
+                            gaze_by_eye,
                         )
                     )
             elif key == ord("s"):

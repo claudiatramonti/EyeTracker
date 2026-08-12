@@ -6,6 +6,10 @@ import time
 
 import cv2
 
+
+# configure the camera capture modes for the given platform.
+# DirectShow is the default on Windows because it is more reliable than MSMF
+# that has known issues in OpenCV library
 CAMERA_CAPTURE_MODES = (
     (
         ("DirectShow", cv2.CAP_DSHOW, None),
@@ -20,7 +24,7 @@ RECONNECT_FAIL_THRESHOLD = 20
 RECONNECT_COOLDOWN_SEC = 1.5
 CAMERA_OPEN_DELAY_SEC = 0.8
 
-
+# configure the capture properties for the given capture object
 def configure_capture(cap, width=None, height=None, fps_request=30):
     if width is not None:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)

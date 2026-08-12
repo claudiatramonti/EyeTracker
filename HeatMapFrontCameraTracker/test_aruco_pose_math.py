@@ -1,4 +1,6 @@
 import unittest
+import os
+import tempfile
 
 import cv2
 import numpy as np
@@ -107,6 +109,38 @@ class ArucoPoseMathTests(unittest.TestCase):
 
         self.assertLess(np.linalg.norm(recovered - target_screen), 0.1)
 
+    def test_camera_calibration_scales_intrinsics(self):
+        camera_matrix = np.array(
+            [[700.0, 0.0, 320.0], [0.0, 710.0, 240.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        distortion = np.array([[0.1, -0.03, 0.001, 0.002, 0.0]], dtype=np.float64)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "calibration.npz")
+            np.savez(
+                path,
+                camera_matrix=camera_matrix,
+                distortion_coefficients=distortion,
+                image_width=np.int32(640),
+                image_height=np.int32(480),
+                rms_error=np.float64(0.42),
+            )
+            loaded = aruco_screen.load_camera_calibration(
+                path,
+                target_width=1280,
+                target_height=960,
+            )
+
+        self.assertIsNotNone(loaded)
+        np.testing.assert_allclose(
+            loaded["camera_matrix"],
+            np.array(
+                [[1400.0, 0.0, 640.0], [0.0, 1420.0, 480.0], [0.0, 0.0, 1.0]]
+            ),
+        )
+        np.testing.assert_allclose(loaded["distortion_coefficients"], distortion)
+        self.assertAlmostEqual(loaded["rms_error"], 0.42)
+
     def test_calibrated_gaze_ray_survives_head_pose_change(self):
         tracker = aruco_screen.ArucoScreenTracker(
             self.width,
@@ -178,6 +212,96 @@ class ArucoPoseMathTests(unittest.TestCase):
         self.assertIsNotNone(projected)
         self.assertLessEqual(abs(projected[0] - target[0]), 1.0)
         self.assertLessEqual(abs(projected[1] - target[1]), 1.0)
+
+    def test_per_eye_projection_averages_pixels(self):
+        tracker = aruco_screen.ArucoScreenTracker(
+            self.width,
+            self.height,
+            marker_size=self.marker_size,
+            marker_margin=self.margin,
+        )
+        calibration_rotation, calibration_translation = self.make_pose(
+            [0.03, -0.08, 0.01],
+            2200.0,
+        )
+        tracker.pose_rotation = calibration_rotation
+        tracker.pose_translation = calibration_translation
+        tracker.pose_ready = True
+
+        left_to_camera, _ = cv2.Rodrigues(
+            np.array([0.10, 0.05, -0.06], dtype=np.float64)
+        )
+        right_to_camera, _ = cv2.Rodrigues(
+            np.array([0.11, 0.04, -0.07], dtype=np.float64)
+        )
+        left_origin = np.array([40.0, -15.0, -110.0], dtype=np.float64)
+        right_origin = np.array([-40.0, -15.0, -110.0], dtype=np.float64)
+        targets = {
+            "center": (self.width * 0.5, self.height * 0.5),
+            "top": (self.width * 0.5, 100.0),
+            "bottom": (self.width * 0.5, self.height - 100.0),
+            "left": (100.0, self.height * 0.5),
+            "right": (self.width - 100.0, self.height * 0.5),
+        }
+
+        mapper = aruco_screen.GazePoseMapper(eye_ids=("left", "right"))
+        for label, point in targets.items():
+            target_camera = tracker.screen_point_position_in_camera(*point)
+            left_dir_cam = target_camera - left_origin
+            left_dir_cam /= np.linalg.norm(left_dir_cam)
+            right_dir_cam = target_camera - right_origin
+            right_dir_cam /= np.linalg.norm(right_dir_cam)
+            saved, _ = mapper.add_calibration_sample(
+                label,
+                {
+                    "left": left_to_camera.T @ left_dir_cam,
+                    "right": right_to_camera.T @ right_dir_cam,
+                },
+                point,
+                tracker,
+            )
+            self.assertTrue(saved)
+
+        self.assertTrue(mapper.calibrated)
+        self.assertEqual(set(mapper.calibrated_eyes()), {"left", "right"})
+
+        runtime_rotation, runtime_translation = self.make_pose(
+            [-0.07, 0.15, -0.03],
+            2100.0,
+        )
+        tracker.pose_rotation = runtime_rotation
+        tracker.pose_translation = runtime_translation
+        target = np.array([1500.0, 420.0, 0.0], dtype=np.float64)
+        left_dir_cam = (
+            runtime_rotation @ target + runtime_translation - left_origin
+        )
+        left_dir_cam /= np.linalg.norm(left_dir_cam)
+        right_dir_cam = (
+            runtime_rotation @ target + runtime_translation - right_origin
+        )
+        right_dir_cam /= np.linalg.norm(right_dir_cam)
+
+        projected = mapper.project(
+            {
+                "left": left_to_camera.T @ left_dir_cam,
+                "right": right_to_camera.T @ right_dir_cam,
+            },
+            tracker,
+        )
+        self.assertIsNotNone(projected)
+        self.assertLessEqual(abs(projected[0] - target[0]), 1.0)
+        self.assertLessEqual(abs(projected[1] - target[1]), 1.0)
+
+    def test_average_unit_directions(self):
+        a = np.array([1.0, 0.0, 0.0])
+        b = np.array([0.0, 1.0, 0.0])
+        averaged = aruco_screen.average_unit_directions([a, b])
+        self.assertIsNotNone(averaged)
+        np.testing.assert_allclose(
+            averaged,
+            np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0),
+            atol=1e-9,
+        )
 
 
 if __name__ == "__main__":
