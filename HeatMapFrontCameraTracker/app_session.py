@@ -165,6 +165,7 @@ def run(
 ):
     os.chdir(ROOT_DIR)
     eye_tracker.set_show_separate_tracking_windows(False)
+    eye_tracker.ensure_gl_sphere_window()
 
     if left_index is None and right_index is None:
         print("Select at least one eye camera.")
@@ -338,6 +339,7 @@ def run(
                     aruco_tracker.pose_ready = False
 
             pose_history.push(fusion_eyes, aruco_tracker)
+            eye_tracker.pump_gl_sphere_events()
 
             ir_calibrating = heatmap_session.calibrating
             pose_available = aruco_tracker is not None and aruco_tracker.pose_ready

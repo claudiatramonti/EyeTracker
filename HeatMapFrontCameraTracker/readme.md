@@ -6,7 +6,9 @@ Designed for DIY glasses with:
 - **2 near-eye IR cameras** (left + right), like the stereo setup in `3DTracker/Orlosky3DEyeTrackerStereo.py`
 - **1 optional front camera** (scene preview with a red gaze dot)
 
-This module does **not** import from `FrontCameraTracker/` or `3DTracker/`. All logic lives in this folder.
+This module keeps tracking/heatmap logic in this folder. Optionally it loads
+`3DTracker/gl_sphere.py` and blends the wireframe sphere into the IR camera
+previews on the heatmap (same composite as Orlosky; no separate GL window).
 
 ## What it does
 
@@ -23,9 +25,12 @@ This module does **not** import from `FrontCameraTracker/` or `3DTracker/`. All 
 - OpenCV (`opencv-python`)
 - NumPy
 - Tkinter (usually included with Python on Windows)
+- Optional OpenGL sphere: `PyQt5` + `PyOpenGL` (and `3DTracker/gl_sphere.py`)
 
 ```bash
 pip install opencv-python numpy
+# optional sphere window:
+pip install PyQt5 PyOpenGL
 ```
 
 ## Hardware

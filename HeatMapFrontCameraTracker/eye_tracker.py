@@ -5,17 +5,74 @@ import random
 import math
 import numpy as np
 import os
+import sys
 import time
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 GAZE_VECTOR_PATH = os.path.join(MODULE_DIR, "gaze_vector.txt")
 
+# Optional OpenGL sphere viz lives in sibling 3DTracker/gl_sphere.py
+_GL_SPHERE_DIR = os.path.join(os.path.dirname(MODULE_DIR), "3DTracker")
+if _GL_SPHERE_DIR not in sys.path:
+    sys.path.insert(0, _GL_SPHERE_DIR)
+
 try:
     import gl_sphere
     GL_SPHERE_AVAILABLE = True
-except ImportError:
+except ImportError as exc:
+    gl_sphere = None
     GL_SPHERE_AVAILABLE = False
-    print("gl_sphere module not found. OpenGL rendering will be disabled.")
+    print(
+        "gl_sphere module not found. OpenGL rendering will be disabled. "
+        f"({exc}) Install PyQt5 + PyOpenGL and keep 3DTracker/gl_sphere.py."
+    )
+
+_gl_window_started = False
+
+
+def ensure_gl_sphere_window():
+    """Create a hidden OpenGL context used to blend the sphere into IR previews."""
+    global _gl_window_started
+    if not GL_SPHERE_AVAILABLE or gl_sphere is None:
+        return False
+    if _gl_window_started and getattr(gl_sphere, "sphere_widget", None) is not None:
+        return True
+    try:
+        # Off-screen context only: sphere is composited into camera PiP like Orlosky.
+        gl_sphere.start_gl_window(visible=False)
+        _gl_window_started = True
+        print("OpenGL sphere overlay enabled (blended into IR camera previews).")
+        return True
+    except Exception as exc:
+        print(f"OpenGL sphere overlay failed: {exc}")
+        return False
+
+
+def pump_gl_sphere_events():
+    """Keep the Qt OpenGL context responsive inside the OpenCV loop."""
+    if not GL_SPHERE_AVAILABLE or gl_sphere is None:
+        return
+    app = getattr(gl_sphere, "app", None)
+    if app is not None:
+        app.processEvents()
+
+
+def _blend_frame_with_sphere(frame, gl_image):
+    """Orlosky-style IR + wireframe sphere composite for the heatmap PiP."""
+    if frame is None or gl_image is None:
+        return frame
+    overlay = np.asarray(gl_image)
+    if overlay.ndim != 3 or overlay.shape[2] < 3:
+        return frame
+    if overlay.shape[0] != frame.shape[0] or overlay.shape[1] != frame.shape[1]:
+        overlay = cv2.resize(overlay, (frame.shape[1], frame.shape[0]))
+    overlay_bgr = cv2.cvtColor(overlay[:, :, :3], cv2.COLOR_RGB2BGR)
+    if overlay_bgr.dtype != frame.dtype:
+        overlay_bgr = overlay_bgr.astype(frame.dtype)
+    try:
+        return cv2.addWeighted(frame, 0.6, overlay_bgr, 0.4, 0)
+    except cv2.error:
+        return frame
 
 EYE_IDS = ("left", "right")
 current_eye_id = "left"
@@ -522,7 +579,8 @@ def _show_tracking_windows(frame, gl_image=None, status_text=None):
         cv2.putText(frame, status_text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
         cv2.putText(frame, status_text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    eye_tracking_states[current_eye_id]["preview_frame"] = frame.copy()
+    preview = _blend_frame_with_sphere(frame, gl_image) if gl_image is not None else frame
+    eye_tracking_states[current_eye_id]["preview_frame"] = preview.copy()
 
     if not show_separate_tracking_windows:
         return
@@ -530,7 +588,7 @@ def _show_tracking_windows(frame, gl_image=None, status_text=None):
     cv2.imshow(eye_window_name("Tracking"), frame)
 
     if GL_SPHERE_AVAILABLE and gl_image is not None:
-        blended = cv2.addWeighted(frame, 0.6, gl_image, 0.4, 0)
+        blended = _blend_frame_with_sphere(frame, gl_image)
         cv2.imshow(eye_window_name("Tracker + Sphere"), blended)
 
 
@@ -694,8 +752,10 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
 
 
     gl_image = None
-    if GL_SPHERE_AVAILABLE:
-        gl_image = gl_sphere.update_sphere_rotation(center_x, center_y, model_center_average[0], model_center_average[1])
+    if GL_SPHERE_AVAILABLE and gl_sphere is not None:
+        gl_image = gl_sphere.update_sphere_rotation(
+            center_x, center_y, model_center_average[0], model_center_average[1]
+        )
     #cv2.circle(frame, (center_x, center_y), 22, (255, 255, 0), -1)  # Draw intersection center
 
     # Call the function

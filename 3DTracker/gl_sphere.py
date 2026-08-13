@@ -4,6 +4,7 @@ import sys
 import numpy as np
 from PyQt5.QtWidgets import QApplication, QMainWindow, QOpenGLWidget
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QImage
 from OpenGL.GL import *
 from OpenGL.GLU import *
 
@@ -218,15 +219,23 @@ class SphereWidget(QOpenGLWidget):
 
         glPopMatrix()
 
-def start_gl_window():
+def start_gl_window(visible=True):
+    """Create the OpenGL sphere widget. Set visible=False to render off-screen only."""
     global app, window, sphere_widget
-    app = QApplication(sys.argv)
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
     window = QMainWindow()
     sphere_widget = SphereWidget()
     window.setCentralWidget(sphere_widget)
     window.setWindowTitle("Wireframe Sphere Eye Tracker Display")
     window.resize(640, 480)
-    window.show()
+    if visible:
+        window.show()
+    else:
+        # Still realize the GL context, but do not show a separate window.
+        window.setAttribute(Qt.WA_DontShowOnScreen, True)
+        window.show()
 
     timer = QTimer()
     timer.timeout.connect(lambda: None)
@@ -237,7 +246,7 @@ def start_gl_window():
 def update_sphere_rotation(x, y, center_x, center_y, screen_width=640, screen_height=480):
     """Call this from the eye tracker with the latest pupil center (x,y) and the center of the sphere (center_x, center_y)."""
     if sphere_widget is None:
-        return
+        return None
 
     # Save pupil center globally for overlay rendering
     global CV_pupil_x
@@ -383,17 +392,19 @@ def update_sphere_rotation(x, y, center_x, center_y, screen_width=640, screen_he
     # Normalize the result to get a direction vector
     gaze_rotated /= np.linalg.norm(gaze_rotated)
 
-    # Redraw the OpenGL scene
-    sphere_widget.update()
+    # Force a paint and read the framebuffer (works even if the Qt window is hidden).
+    sphere_widget.makeCurrent()
+    qimage = sphere_widget.grabFramebuffer()
+    if qimage is None or qimage.isNull():
+        sphere_widget.update()
+        return None
 
-    # Flush OpenGL pipeline and read back pixels
-    glFinish()
-    w = sphere_widget.width()
-    h = sphere_widget.height()
-    glReadBuffer(GL_FRONT)
-    pixels = glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE)
-    image = np.frombuffer(pixels, dtype=np.uint8).reshape((h, w, 3))
-    image = np.flipud(image)
-
+    qimage = qimage.convertToFormat(QImage.Format_RGB888)
+    width = qimage.width()
+    height = qimage.height()
+    ptr = qimage.bits()
+    byte_count = qimage.byteCount() if hasattr(qimage, "byteCount") else qimage.sizeInBytes()
+    ptr.setsize(byte_count)
+    image = np.frombuffer(ptr, dtype=np.uint8).reshape((height, width, 3)).copy()
     return image
 
