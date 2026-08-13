@@ -213,6 +213,70 @@ class ArucoPoseMathTests(unittest.TestCase):
         self.assertLessEqual(abs(projected[0] - target[0]), 1.0)
         self.assertLessEqual(abs(projected[1] - target[1]), 1.0)
 
+    def test_anchored_projection_matches_static_at_reference_pose(self):
+        tracker = aruco_screen.ArucoScreenTracker(
+            self.width,
+            self.height,
+            marker_size=self.marker_size,
+            marker_margin=self.margin,
+        )
+        calibration_rotation, calibration_translation = self.make_pose(
+            [0.04, -0.10, 0.02],
+            2200.0,
+        )
+        tracker.pose_rotation = calibration_rotation
+        tracker.pose_translation = calibration_translation
+        tracker.pose_ready = True
+
+        gaze_to_camera, _ = cv2.Rodrigues(
+            np.array([0.12, 0.06, -0.08], dtype=np.float64)
+        )
+        eye_origin_camera = np.array([35.0, -20.0, -120.0], dtype=np.float64)
+        targets = {
+            "center": (self.width * 0.5, self.height * 0.5),
+            "top": (self.width * 0.5, 100.0),
+            "bottom": (self.width * 0.5, self.height - 100.0),
+            "left": (100.0, self.height * 0.5),
+            "right": (self.width - 100.0, self.height * 0.5),
+        }
+
+        mapper = aruco_screen.GazePoseMapper()
+        for label, point in targets.items():
+            target_camera = tracker.screen_point_position_in_camera(*point)
+            direction_camera = target_camera - eye_origin_camera
+            direction_camera /= np.linalg.norm(direction_camera)
+            direction_gaze = gaze_to_camera.T @ direction_camera
+            saved, _ = mapper.add_calibration_sample(
+                label,
+                direction_gaze,
+                point,
+                tracker,
+            )
+            self.assertTrue(saved)
+
+        self.assertTrue(mapper.anchored_ready)
+        static_point = (1234, 567)
+        # Bias the absolute projection with a wrong origin, but anchored delta
+        # at the reference pose must still return the static baseline.
+        only_eye = mapper.calibrated_eyes()[0]
+        mapper.extrinsics[only_eye]["origin"] = np.array(
+            [80.0, -40.0, -50.0],
+            dtype=np.float64,
+        )
+        gaze = gaze_to_camera.T @ np.array([0.0, 0.0, 1.0])
+        anchored = mapper.project_anchored(gaze, tracker, static_point)
+        self.assertEqual(anchored, static_point)
+
+        runtime_rotation, runtime_translation = self.make_pose(
+            [-0.09, 0.18, -0.04],
+            2050.0,
+        )
+        tracker.pose_rotation = runtime_rotation
+        tracker.pose_translation = runtime_translation
+        moved = mapper.project_anchored(gaze, tracker, static_point)
+        self.assertIsNotNone(moved)
+        self.assertNotEqual(moved, static_point)
+
     def test_per_eye_projection_averages_pixels(self):
         tracker = aruco_screen.ArucoScreenTracker(
             self.width,
@@ -302,6 +366,27 @@ class ArucoPoseMathTests(unittest.TestCase):
             np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0),
             atol=1e-9,
         )
+
+    def test_front_camera_to_screen_reports_off_screen(self):
+        src = np.array(
+            [[10.0, 10.0], [100.0, 10.0], [100.0, 100.0], [10.0, 100.0]],
+            dtype=np.float32,
+        )
+        dst = np.array(
+            [[0.0, 0.0], [200.0, 0.0], [200.0, 100.0], [0.0, 100.0]],
+            dtype=np.float32,
+        )
+        homography, _ = cv2.findHomography(src, dst)
+        inside = aruco_screen.front_camera_to_screen(
+            55.0, 55.0, homography, 200, 100, clip=False
+        )
+        self.assertIsNotNone(inside)
+        self.assertTrue(inside[2])
+        outside = aruco_screen.front_camera_to_screen(
+            200.0, 55.0, homography, 200, 100, clip=False
+        )
+        self.assertIsNotNone(outside)
+        self.assertFalse(outside[2])
 
 
 if __name__ == "__main__":

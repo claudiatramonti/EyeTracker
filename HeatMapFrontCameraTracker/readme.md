@@ -100,17 +100,17 @@ Calibrate on the **Gaze Heatmap** window while looking at the matching spot on y
 
 | Step | Key | Action |
 |------|-----|--------|
-| 1 | **C** | Look at the **screen center** |
-| 2 | **↑** | Look at the top target |
+| 1 | **C** | Look at the **screen center** (also links IR ↔ front camera) |
+| 2 | **↑** | Look at the top target (optional static fallback) |
 | 3 | **↓** | Look at the bottom target |
 | 4 | **←** | Look at the left target |
 | 5 | **→** | Look at the right target |
 
-Recording starts after all five points are valid. With a calibrated front camera
-and visible ArUco markers, the same keys also build a per-eye 6DoF head map
-(multi-frame burst per key). Keep your head still while pressing each key; after
-`Gaze 6DoF: pronto`, normal head movement is compensated. Without front
-calibration / markers, the five-point map stays static.
+With a front camera and visible ArUco markers, **C alone** enables the primary
+map: IR gaze → front pinhole at **FOV 60°** → ArUco homography → monitor pixels.
+A red dot shows the gaze on the front preview. If the projected point leaves the
+monitor, the HUD reports `FUORI SCHERMO`. The five arrow keys still build the
+static piecewise map used as fallback when markers/FOV mapping are unavailable.
 
 ### Other keys (heatmap window)
 
@@ -208,14 +208,18 @@ Run `HeatMapFrontCameraTracker.py` with **Front camera** enabled. The window **E
 - Cyan monitor outline when all 4 corner IDs are visible
 - Status line on the heatmap HUD (`ArUco homography: OK`)
 
-### Phase 3 — 6DoF head compensation (integrated)
+### Phase 3 — FOV + ArUco screen mapping (primary)
 
-Requires **Front camera** plus `front_camera_calibration.npz` (see above):
+With **Front camera** enabled:
 
-1. Filtered `solvePnP` estimates the screen-to-front-camera pose from ≥3 marker corners.
-2. Each calibration key uses a short rolling average of recent per-eye IR gaze
-   (and matching ArUco pose) collected by the live loop — no blocking burst.
-3. At runtime each calibrated eye is projected to the screen plane; pixel results are averaged.
-4. If markers are briefly lost, the app falls back to the static five-point map until pose returns.
+1. Front gaze projection uses a **60° FOV** pinhole (`fx = (W/2)/tan(30°)`).
+2. Press **C** while looking at the monitor center → builds `R_gaze_to_cam` (IR ↔ front).
+3. ArUco corner markers give a live homography front-image → monitor pixels.
+4. Heatmap point = gaze projected onto the front view, then warped by the homography.
+5. If the point falls outside the monitor, HUD shows `FUORI SCHERMO`.
 
-Complete **C + ↑ + ↓ + ← + →** with head still and markers visible. HUD then shows `Mapping: ArUco 6DoF per-occhio`. Without front calibration, 6DoF stays OFF and only the static map is used.
+Keep **4 markers** visible. Chessboard `front_camera_calibration.npz` (if present)
+still improves ArUco pose estimates; gaze→front uses FOV 60° as specified.
+
+The older 6DoF delta path remains in code but is **off** by default
+(`ENABLE_HEAD_POSE_MAPPING = False`).

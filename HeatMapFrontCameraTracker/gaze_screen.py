@@ -1,4 +1,10 @@
-"""Gaze-to-screen mapping and heatmap rendering for HeatMapFrontCameraTracker."""
+"""5-point gaze-to-monitor map and heatmap for HeatMapFrontCameraTracker.
+
+C sets the current fused gaze as forward (yaw=pitch=0 at screen center).
+Arrow keys store (yaw, pitch) → known edge pixels. Those 5 anchors become
+four piecewise-affine triangles. At runtime: fused gaze → yaw/pitch →
+barycentric interpolate in the containing triangle → monitor pixel.
+"""
 
 import sys
 
@@ -43,7 +49,7 @@ def format_camera_status_lines(camera_status):
 
 
 def rotation_from_a_to_b(a, b):
-    """Rotation matrix R such that R @ a = b (Rodrigues)."""
+    """Rotation R such that R @ a = b. Used at C to make center gaze 'forward'."""
     a = normalize_direction(a)
     b = normalize_direction(b)
     if a is None or b is None:
@@ -89,6 +95,7 @@ def normalize_direction(direction):
 
 
 def gaze_angles(direction, rotation, swap_axes=False):
+    """Horizontal/vertical gaze vs center: yaw=gx/gz, pitch=gy/gz (not degrees)."""
     if direction is None or rotation is None:
         return None
     g = rotation @ direction
@@ -110,7 +117,7 @@ def _samples_by_edge(cal_samples):
 
 
 def _triangle_transform(source, target):
-    """Precompute a barycentric transform for one gaze/screen triangle."""
+    """Affine map for one triangle: 3 (yaw,pitch) points → 3 screen pixels."""
     source = np.asarray(source, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     if (
@@ -210,6 +217,7 @@ def _project_piecewise_feature(yaw, pitch, mapping):
 
 
 def project_gaze_mapping(direction, rotation, mapping, width, height, swap_axes=False):
+    """Fused gaze → yaw/pitch → piecewise triangle → clipped monitor pixel."""
     angles = gaze_angles(direction, rotation, swap_axes=swap_axes)
     if angles is None or mapping is None:
         return None
@@ -324,6 +332,7 @@ class GazeHeatmapSession:
         self.last_cal_debug = None
 
     def _record_calibration_point(self, direction, target_u, target_v, edge_name):
+        """Arrow key: save current (yaw, pitch) against a known edge pixel."""
         direction = normalize_direction(direction)
         if direction is None or self.rotation is None:
             return False, "No valid gaze direction."
@@ -419,6 +428,7 @@ class GazeHeatmapSession:
         self._display_v = None
 
     def set_center_calibration(self, direction, rotation=None):
+        """C: this gaze is forward; center pixel is (cx, cy) at yaw=pitch=0."""
         direction = normalize_direction(direction)
         if direction is None:
             return False, "No valid gaze direction."
@@ -479,6 +489,7 @@ class GazeHeatmapSession:
         return f"Swap axes: {'ON' if self.swap_axes else 'OFF'}; calibration reset."
 
     def _project_point(self, direction):
+        """Apply the 5-point piecewise map if all edges are calibrated."""
         if self.calibration_mapping is not None and self.mapping_ready:
             return project_gaze_mapping(
                 direction,
@@ -489,6 +500,13 @@ class GazeHeatmapSession:
                 swap_axes=self.swap_axes,
             )
         return None
+
+    def project_to_screen(self, direction):
+        """Return the static mapping pixel without writing the heatmap."""
+        direction = normalize_direction(direction)
+        if direction is None or self.rotation is None or not self.mapping_ready:
+            return None
+        return self._project_point(direction)
 
     def calibration_debug_lines(self):
         if not self.center_calibrated:
@@ -566,6 +584,7 @@ class GazeHeatmapSession:
         return True
 
     def update(self, direction):
+        """Runtime: map fused gaze through the 5-point map and accumulate heatmap."""
         direction = normalize_direction(direction)
         self.last_point = None
         self.last_yaw_pitch = None
@@ -604,15 +623,15 @@ class GazeHeatmapSession:
         return self._apply_gaze_point((u, v))
 
     def update_via_aruco(self, direction, homography, R_gaze_to_cam, cam_width, cam_height, cam_cx, cam_cy, cam_fx, cam_fy):
-        """Map gaze through front camera + ArUco homography (no C/B/R scales)."""
+        """Map gaze through front camera FOV + ArUco homography."""
         direction = normalize_direction(direction)
         self.last_point = None
         self.last_yaw_pitch = None
 
         if direction is None or homography is None:
-            return False
+            return False, "no_gaze"
 
-        point = aruco_screen.project_gaze_to_monitor_pixels(
+        result = aruco_screen.project_gaze_to_monitor_result(
             direction,
             R_gaze_to_cam,
             homography,
@@ -625,7 +644,14 @@ class GazeHeatmapSession:
             cam_fx=cam_fx,
             cam_fy=cam_fy,
         )
-        return self.update_screen_point(point)
+        if result is None:
+            return False, "no_projection"
+        sx, sy, on_screen = result
+        if not on_screen:
+            self.last_point = None
+            return False, "off_screen"
+        ok = self.update_screen_point((sx, sy))
+        return ok, "ok" if ok else "no_projection"
 
     def draw_calibration_guides(self, frame, aruco_mapping=False):
         if aruco_mapping:

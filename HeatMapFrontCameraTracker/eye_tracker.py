@@ -1,4 +1,9 @@
-"""Self-contained 3D eye tracker used by HeatMapFrontCameraTracker."""
+"""Per-eye IR tracking and stereo fusion for HeatMapFrontCameraTracker.
+
+Each IR camera estimates a 3D gaze direction (pupil vs locked sphere).
+Left and right are fused as normalize(dir_left + dir_right); one valid eye
+is used alone. The fused vector is EMA-smoothed for the heatmap.
+"""
 
 import cv2
 import random
@@ -100,8 +105,10 @@ EXT_WIDTH = 640
 EXT_HEIGHT = 480
 EXT_CX = EXT_WIDTH // 2
 EXT_CY = EXT_HEIGHT // 2
-EXT_FX = 600.0
-EXT_FY = 600.0
+# Horizontal FOV used when no chessboard intrinsics drive gaze→front projection.
+FRONT_FOV_DEG = 60.0
+EXT_FX = (EXT_WIDTH * 0.5) / math.tan(math.radians(FRONT_FOV_DEG * 0.5))
+EXT_FY = EXT_FX
 circle_x = EXT_CX
 circle_y = EXT_CY
 
@@ -186,6 +193,7 @@ def reset_eye_tracking_state(eye_id):
 
 
 def get_eye_gaze_dir(eye_id):
+    """Latest unit gaze direction for one eye, or None if not tracked."""
     direction = eye_tracking_states[eye_id]["last_gaze_dir"]
     if direction is None:
         return None
@@ -197,6 +205,7 @@ def get_eye_gaze_dir(eye_id):
 
 
 def combine_gaze_directions(*directions):
+    """Fuse eye directions: sum unit vectors, then renormalize."""
     valid = []
     for direction in directions:
         if direction is None:
@@ -252,6 +261,7 @@ def smooth_combined_gaze(direction, alpha=GAZE_DIRECTION_SMOOTH_ALPHA):
 
 
 def refresh_combined_gaze(active_eyes=EYE_IDS):
+    """Fuse the active eyes and return the smoothed combined direction."""
     global combined_gaze_dir, last_gaze_dir
 
     directions = [get_eye_gaze_dir(eye_id) for eye_id in active_eyes]
@@ -299,15 +309,36 @@ def update_eye_gaze_output(eye_id, sphere_center, gaze_direction):
     write_gaze_vector_file()
 
 
-def configure_external_viewport(width, height):
+def focal_length_from_fov(image_size, fov_deg=None):
+    """Pinhole fx/fy for a given FOV (degrees) across `image_size` pixels."""
+    fov = FRONT_FOV_DEG if fov_deg is None else float(fov_deg)
+    half = max(int(image_size), 1) * 0.5
+    return float(half / math.tan(math.radians(fov * 0.5)))
+
+
+def configure_external_viewport(width, height, fov_deg=None, fx=None, fy=None):
+    """
+    Set front-camera pinhole model for gaze projection.
+
+    Default: FOV 60° (same fx/fy). Pass fx/fy explicitly to use chessboard
+    intrinsics instead.
+    """
     global EXT_WIDTH, EXT_HEIGHT, EXT_CX, EXT_CY, EXT_FX, EXT_FY, circle_x, circle_y
+    global FRONT_FOV_DEG
 
     EXT_WIDTH = max(int(width), 1)
     EXT_HEIGHT = max(int(height), 1)
     EXT_CX = EXT_WIDTH // 2
     EXT_CY = EXT_HEIGHT // 2
-    EXT_FX = 600.0 * (EXT_WIDTH / 640.0)
-    EXT_FY = 600.0 * (EXT_HEIGHT / 480.0)
+    if fx is not None and fy is not None:
+        EXT_FX = float(fx)
+        EXT_FY = float(fy)
+    else:
+        if fov_deg is not None:
+            FRONT_FOV_DEG = float(fov_deg)
+        EXT_FX = focal_length_from_fov(EXT_WIDTH, FRONT_FOV_DEG)
+        # Keep square pixels: same fy from horizontal FOV (FOV 60).
+        EXT_FY = EXT_FX
     circle_x, circle_y = EXT_CX, EXT_CY
 
 

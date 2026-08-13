@@ -540,9 +540,19 @@ class ArucoScreenTracker:
             return None
         return point_camera
 
-    def project_camera_ray_to_screen(self, direction_camera, origin_camera=None):
+    def project_camera_ray_to_screen(
+        self,
+        direction_camera,
+        origin_camera=None,
+        pose_rotation=None,
+        pose_translation=None,
+    ):
         """Intersect a front-camera-frame ray with the screen plane z=0."""
-        if not self.pose_ready:
+        rotation = self.pose_rotation if pose_rotation is None else pose_rotation
+        translation = self.pose_translation if pose_translation is None else pose_translation
+        if rotation is None or translation is None:
+            return None
+        if pose_rotation is None and pose_translation is None and not self.pose_ready:
             return None
         direction_camera = np.asarray(direction_camera, dtype=np.float64)
         norm = np.linalg.norm(direction_camera)
@@ -559,10 +569,8 @@ class ArucoScreenTracker:
         if origin_camera.shape != (3,) or not np.all(np.isfinite(origin_camera)):
             return None
 
-        rotation_camera_to_screen = self.pose_rotation.T
-        origin_screen = rotation_camera_to_screen @ (
-            origin_camera - self.pose_translation
-        )
+        rotation_camera_to_screen = rotation.T
+        origin_screen = rotation_camera_to_screen @ (origin_camera - translation)
         direction_screen = rotation_camera_to_screen @ direction_camera
         if abs(direction_screen[2]) < 1e-9:
             return None
@@ -626,11 +634,16 @@ class ArucoScreenTracker:
 
 class GazePoseMapper:
     """
-    Per-eye fixed transform from IR gaze space into the front-camera frame.
+    Head compensation anchored to the trusted static 5-point map.
 
-    Each calibration label stores independent samples for every available eye.
-    At runtime each calibrated eye is projected to the screen and the pixel
-    results are averaged. This avoids fusing incompatible eye rays first.
+    Absolute IR→camera→screen projection alone is too noisy for resting accuracy.
+    Instead we keep the static map as the baseline and apply only the pixel delta
+    predicted by the change in ArUco head pose relative to calibration:
+
+        p = p_static + (p_abs(now) - p_abs(ref_pose))
+
+    At the calibration head pose the delta is ~0, so resting tracking matches the
+    static map. Head motion then warps that baseline.
     """
 
     REQUIRED_LABELS = frozenset(("center", "top", "bottom", "left", "right"))
@@ -642,10 +655,21 @@ class GazePoseMapper:
         self.angular_rms_deg = None
         self.rotation_gaze_to_camera = None
         self.origin_gaze_in_camera = np.zeros(3, dtype=np.float64)
+        self.reference_rotation = None
+        self.reference_translation = None
+        self._reference_pose_samples = []
 
     @property
     def calibrated(self):
         return bool(self.extrinsics)
+
+    @property
+    def anchored_ready(self):
+        return (
+            self.calibrated
+            and self.reference_rotation is not None
+            and self.reference_translation is not None
+        )
 
     def calibrated_eyes(self):
         return tuple(self.extrinsics.keys())
@@ -656,6 +680,9 @@ class GazePoseMapper:
         self.angular_rms_deg = None
         self.rotation_gaze_to_camera = None
         self.origin_gaze_in_camera = np.zeros(3, dtype=np.float64)
+        self.reference_rotation = None
+        self.reference_translation = None
+        self._reference_pose_samples = []
 
     @staticmethod
     def _angular_rms_deg(rotation, origin, gaze_rows, target_positions):
@@ -744,6 +771,8 @@ class GazePoseMapper:
         label,
         gaze_by_eye,
         target_position_camera,
+        pose_rotation=None,
+        pose_translation=None,
     ):
         """Store a sample using an already-averaged camera-frame target point."""
         if label not in self.REQUIRED_LABELS:
@@ -775,7 +804,34 @@ class GazePoseMapper:
 
         if not saved_eyes:
             return False, "Posa 6DoF non salvata: nessun vettore occhio valido."
+
+        if pose_rotation is not None and pose_translation is not None:
+            rotation = np.asarray(pose_rotation, dtype=np.float64)
+            translation = np.asarray(pose_translation, dtype=np.float64)
+            if rotation.shape == (3, 3) and translation.shape == (3,):
+                self._reference_pose_samples.append((rotation.copy(), translation.copy()))
+
         return self._finalize_calibration_after_sample(label)
+
+    def _average_reference_pose(self):
+        if not self._reference_pose_samples:
+            return None, None
+        rotations = [sample[0] for sample in self._reference_pose_samples]
+        translations = np.asarray(
+            [sample[1] for sample in self._reference_pose_samples],
+            dtype=np.float64,
+        )
+        blended = np.mean(np.asarray(rotations, dtype=np.float64), axis=0)
+        try:
+            u, _, vt = np.linalg.svd(blended)
+        except np.linalg.LinAlgError:
+            return None, None
+        rotation = u @ vt
+        if np.linalg.det(rotation) < 0.0:
+            u[:, -1] *= -1.0
+            rotation = u @ vt
+        translation = np.mean(translations, axis=0)
+        return rotation, translation
 
     def _finalize_calibration_after_sample(self, label):
         candidate_extrinsics = dict(self.extrinsics)
@@ -804,6 +860,12 @@ class GazePoseMapper:
             float(np.mean(rms_values)) if rms_values else None
         )
 
+        if self.extrinsics:
+            ref_rotation, ref_translation = self._average_reference_pose()
+            if ref_rotation is not None and ref_translation is not None:
+                self.reference_rotation = ref_rotation
+                self.reference_translation = ref_translation
+
         # Compatibility aliases for older callers/tests.
         if "combined" in self.extrinsics:
             only = self.extrinsics["combined"]
@@ -822,11 +884,17 @@ class GazePoseMapper:
             for samples in self.samples.values()
             if samples
         ) if any(self.samples.values()) else 0
-        if self.calibrated:
+        if self.anchored_ready:
             eyes = ",".join(self.calibrated_eyes())
             return (
                 True,
-                f"Posa gaze 6DoF pronta ({self.angular_rms_deg:.1f}° RMS, occhi: {eyes}).",
+                f"Posa gaze 6DoF pronta ({self.angular_rms_deg:.1f}° RMS, occhi: {eyes}, "
+                "ancora sul map statico).",
+            )
+        if self.calibrated and not self.anchored_ready:
+            return (
+                True,
+                f"Campione posa 6DoF {label} salvato, ma manca pose ArUco di riferimento.",
             )
         return True, f"Campione posa 6DoF {label} salvato ({ready_count}/5)."
 
@@ -856,23 +924,27 @@ class GazePoseMapper:
             label,
             gaze_by_eye,
             target_position,
+            pose_rotation=screen_tracker.pose_rotation,
+            pose_translation=screen_tracker.pose_translation,
         )
 
-    def project(self, gaze_direction_or_by_eye, screen_tracker):
-        if not self.calibrated or screen_tracker is None or not screen_tracker.pose_ready:
-            return None
-
+    def _normalize_gaze_by_eye(self, gaze_direction_or_by_eye):
         if isinstance(gaze_direction_or_by_eye, dict):
-            gaze_by_eye = gaze_direction_or_by_eye
-        else:
-            if "combined" in self.extrinsics:
-                gaze_by_eye = {"combined": gaze_direction_or_by_eye}
-            elif len(self.extrinsics) == 1:
-                only_eye = next(iter(self.extrinsics))
-                gaze_by_eye = {only_eye: gaze_direction_or_by_eye}
-            else:
-                return None
+            return gaze_direction_or_by_eye
+        if "combined" in self.extrinsics:
+            return {"combined": gaze_direction_or_by_eye}
+        if len(self.extrinsics) == 1:
+            only_eye = next(iter(self.extrinsics))
+            return {only_eye: gaze_direction_or_by_eye}
+        return None
 
+    def _project_with_pose(
+        self,
+        gaze_by_eye,
+        screen_tracker,
+        pose_rotation,
+        pose_translation,
+    ):
         points = []
         for eye_id, extrinsic in self.extrinsics.items():
             gaze = gaze_by_eye.get(eye_id)
@@ -886,20 +958,87 @@ class GazePoseMapper:
             point = screen_tracker.project_camera_ray_to_screen(
                 direction_camera,
                 origin_camera=extrinsic["origin"],
+                pose_rotation=pose_rotation,
+                pose_translation=pose_translation,
             )
             if point is not None:
                 points.append(point)
-
         if not points:
             return None
         mean_u = float(np.mean([point[0] for point in points]))
         mean_v = float(np.mean([point[1] for point in points]))
-        return int(round(mean_u)), int(round(mean_v))
+        return mean_u, mean_v
+
+    def project(self, gaze_direction_or_by_eye, screen_tracker):
+        if not self.calibrated or screen_tracker is None or not screen_tracker.pose_ready:
+            return None
+        gaze_by_eye = self._normalize_gaze_by_eye(gaze_direction_or_by_eye)
+        if gaze_by_eye is None:
+            return None
+        projected = self._project_with_pose(
+            gaze_by_eye,
+            screen_tracker,
+            screen_tracker.pose_rotation,
+            screen_tracker.pose_translation,
+        )
+        if projected is None:
+            return None
+        return int(round(projected[0])), int(round(projected[1]))
+
+    def project_anchored(self, gaze_direction_or_by_eye, screen_tracker, static_point):
+        """
+        Keep the static 5-point pixel, then add only the head-pose delta.
+
+        p = p_static + (p_abs(now) - p_abs(ref))
+        """
+        if static_point is None:
+            return None
+        if not self.anchored_ready or screen_tracker is None or not screen_tracker.pose_ready:
+            return (
+                int(round(static_point[0])),
+                int(round(static_point[1])),
+            )
+
+        gaze_by_eye = self._normalize_gaze_by_eye(gaze_direction_or_by_eye)
+        if gaze_by_eye is None:
+            return (
+                int(round(static_point[0])),
+                int(round(static_point[1])),
+            )
+
+        p_now = self._project_with_pose(
+            gaze_by_eye,
+            screen_tracker,
+            screen_tracker.pose_rotation,
+            screen_tracker.pose_translation,
+        )
+        p_ref = self._project_with_pose(
+            gaze_by_eye,
+            screen_tracker,
+            self.reference_rotation,
+            self.reference_translation,
+        )
+        if p_now is None or p_ref is None:
+            return (
+                int(round(static_point[0])),
+                int(round(static_point[1])),
+            )
+
+        u = float(static_point[0]) + (p_now[0] - p_ref[0])
+        v = float(static_point[1]) + (p_now[1] - p_ref[1])
+        return (
+            int(np.clip(round(u), 0, screen_tracker.screen_width - 1)),
+            int(np.clip(round(v), 0, screen_tracker.screen_height - 1)),
+        )
 
     def status_line(self):
-        if self.calibrated:
+        if self.anchored_ready:
             eyes = ",".join(self.calibrated_eyes())
-            return f"Gaze 6DoF: pronto ({self.angular_rms_deg:.1f}° RMS, {eyes})"
+            return (
+                f"Gaze 6DoF: delta-pronto ({self.angular_rms_deg:.1f}° RMS, {eyes})"
+            )
+        if self.calibrated:
+            return "Gaze 6DoF: estrinseche OK, manca pose di riferimento"
         counts = [
             len(self.REQUIRED_LABELS.intersection(samples))
             for samples in self.samples.values()
@@ -957,8 +1096,20 @@ def gaze_to_front_camera_pixels(
     return u, v
 
 
-def front_camera_to_screen(u, v, homography, screen_width, screen_height):
-    """Map a front-camera pixel to monitor coordinates using ArUco homography."""
+def front_camera_to_screen(
+    u,
+    v,
+    homography,
+    screen_width,
+    screen_height,
+    clip=True,
+):
+    """
+    Map a front-camera pixel to monitor coordinates using ArUco homography.
+
+    Returns (sx, sy, on_screen). When clip=False and the point is outside the
+    monitor, sx/sy are still the unclamped rounded values and on_screen is False.
+    """
     if homography is None:
         return None
 
@@ -972,9 +1123,14 @@ def front_camera_to_screen(u, v, homography, screen_width, screen_height):
     if not np.isfinite(x) or not np.isfinite(y):
         return None
 
-    sx = int(np.clip(round(x), 0, screen_width - 1))
-    sy = int(np.clip(round(y), 0, screen_height - 1))
-    return sx, sy
+    on_screen = 0.0 <= x < float(screen_width) and 0.0 <= y < float(screen_height)
+    if clip:
+        sx = int(np.clip(round(x), 0, screen_width - 1))
+        sy = int(np.clip(round(y), 0, screen_height - 1))
+    else:
+        sx = int(round(x))
+        sy = int(round(y))
+    return sx, sy, on_screen
 
 
 def project_gaze_to_monitor_pixels(
@@ -989,12 +1145,16 @@ def project_gaze_to_monitor_pixels(
     cam_cy=None,
     cam_fx=600.0,
     cam_fy=600.0,
+    clip=True,
 ):
     """
-    Full chain: IR gaze → front-camera UV → homography → monitor pixel (x, y).
+    Full chain: IR gaze → front-camera UV (FOV/pinhole) → ArUco homography → monitor.
 
     Requires R_gaze_to_cam from pressing C (links IR space to front camera).
-    Requires homography from 4/4 ArUco corner markers on the front camera.
+    Requires homography from corner ArUco markers on the front camera.
+
+    Returns (sx, sy) when on-screen (or clipped). Returns None if projection fails
+    or (when clip=False) if the gaze falls outside the monitor.
     """
     uv = gaze_to_front_camera_pixels(
         gaze_direction,
@@ -1008,7 +1168,56 @@ def project_gaze_to_monitor_pixels(
     )
     if uv is None:
         return None
-    return front_camera_to_screen(uv[0], uv[1], homography, screen_width, screen_height)
+    mapped = front_camera_to_screen(
+        uv[0],
+        uv[1],
+        homography,
+        screen_width,
+        screen_height,
+        clip=clip,
+    )
+    if mapped is None:
+        return None
+    sx, sy, on_screen = mapped
+    if not on_screen and not clip:
+        return None
+    return sx, sy
+
+
+def project_gaze_to_monitor_result(
+    gaze_direction,
+    R_gaze_to_cam,
+    homography,
+    screen_width,
+    screen_height,
+    cam_width,
+    cam_height,
+    cam_cx=None,
+    cam_cy=None,
+    cam_fx=600.0,
+    cam_fy=600.0,
+):
+    """Like project_gaze_to_monitor_pixels but returns (sx, sy, on_screen) or None."""
+    uv = gaze_to_front_camera_pixels(
+        gaze_direction,
+        R_gaze_to_cam,
+        cam_width,
+        cam_height,
+        cam_cx=cam_cx,
+        cam_cy=cam_cy,
+        cam_fx=cam_fx,
+        cam_fy=cam_fy,
+    )
+    if uv is None:
+        return None
+    return front_camera_to_screen(
+        uv[0],
+        uv[1],
+        homography,
+        screen_width,
+        screen_height,
+        clip=False,
+    )
 
 
 def generate_marker_sheet(output_dir, marker_ids=(0, 1, 2, 3), side_pixels=320, margin=24):

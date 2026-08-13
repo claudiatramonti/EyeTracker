@@ -1,4 +1,9 @@
-"""Main tracking session: cameras, heatmap loop, ArUco overlays."""
+"""Main loop: IR cameras, fusion, heatmap, optional front/ArUco.
+
+Each frame: track each eye, fuse directions, then map to the monitor.
+Primary heatmap path is the 5-point IR map in gaze_screen (C + arrows).
+Front camera + ArUco are optional (FOV/homography or experimental 6DoF).
+"""
 
 import os
 import sys
@@ -17,9 +22,12 @@ from input_poll import KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_UP, poll_control_key
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Prefer head-pose mapping when the front camera has real intrinsics and the
-# per-eye 6DoF calibration succeeds. Otherwise keep the static 5-point map.
-ENABLE_HEAD_POSE_MAPPING = True
+# IR gaze → front FOV projection → ArUco homography → monitor.
+# Primary when front camera + C (R_gaze_to_cam) + markers are ready.
+ENABLE_FOV_SCREEN_MAPPING = True
+# Legacy experimental 6DoF delta path (kept off; FOV+homography is preferred).
+ENABLE_HEAD_POSE_MAPPING = False
+FRONT_FOV_DEG = 60.0
 
 
 def _format_fusion_status(fusion_eyes, active_eyes):
@@ -77,7 +85,7 @@ class PoseGazeHistory:
             )
 
     def snapshot(self, eye_ids, screen_point, min_samples=None):
-        """Average recent gaze and camera-frame target for one screen point."""
+        """Average recent gaze, camera-frame target, and ArUco pose."""
         min_samples = (
             aruco_screen.CALIBRATION_HISTORY_MIN
             if min_samples is None
@@ -89,6 +97,8 @@ class PoseGazeHistory:
         )
         gaze_by_eye = {}
         target_sums = []
+        rotations = []
+        translations = []
         for eye_id in eye_ids:
             bucket = self._by_eye.get(eye_id)
             if not bucket or len(bucket) < min_samples:
@@ -100,11 +110,23 @@ class PoseGazeHistory:
             gaze_by_eye[eye_id] = averaged
             for _, rotation, translation in bucket:
                 target_sums.append(rotation @ point_screen + translation)
+                rotations.append(rotation)
+                translations.append(translation)
 
         if not gaze_by_eye or not target_sums:
-            return {}, None
+            return {}, None, None, None
         target = np.mean(np.asarray(target_sums, dtype=np.float64), axis=0)
-        return gaze_by_eye, target
+        translation = np.mean(np.asarray(translations, dtype=np.float64), axis=0)
+        blended = np.mean(np.asarray(rotations, dtype=np.float64), axis=0)
+        try:
+            u, _, vt = np.linalg.svd(blended)
+            rotation = u @ vt
+            if np.linalg.det(rotation) < 0.0:
+                u[:, -1] *= -1.0
+                rotation = u @ vt
+        except np.linalg.LinAlgError:
+            rotation = rotations[-1]
+        return gaze_by_eye, target, rotation, translation
 
 
 def _calibration_target(heatmap_session, label):
@@ -120,7 +142,10 @@ def _record_pose_sample_from_history(pose_mapper, history, heatmap_session, labe
     if pose_mapper is None:
         return "Posa 6DoF non attiva."
     target_uv = _calibration_target(heatmap_session, label)
-    gaze_by_eye, target_camera = history.snapshot(eye_ids, target_uv)
+    gaze_by_eye, target_camera, pose_rotation, pose_translation = history.snapshot(
+        eye_ids,
+        target_uv,
+    )
     if not gaze_by_eye or target_camera is None:
         return (
             "Posa 6DoF non salvata: servi almeno "
@@ -131,6 +156,8 @@ def _record_pose_sample_from_history(pose_mapper, history, heatmap_session, labe
         label,
         gaze_by_eye,
         target_camera,
+        pose_rotation=pose_rotation,
+        pose_translation=pose_translation,
     )
     return message
 
@@ -163,6 +190,7 @@ def run(
     flip_front=True,
     mirror_front=True,
 ):
+    """Open cameras and run the heatmap loop (fusion + C/arrows mapping)."""
     os.chdir(ROOT_DIR)
     eye_tracker.set_show_separate_tracking_windows(False)
     eye_tracker.ensure_gl_sphere_window()
@@ -242,6 +270,15 @@ def run(
 
     eye_tracker.calibrated = False
     eye_tracker.reset_gaze_smoothing()
+    eye_tracker.configure_external_viewport(
+        eye_tracker.EXT_WIDTH,
+        eye_tracker.EXT_HEIGHT,
+        fov_deg=FRONT_FOV_DEG,
+    )
+    print(
+        f"Front gaze projection: FOV {FRONT_FOV_DEG:.0f}° "
+        f"(fx={eye_tracker.EXT_FX:.1f}, fy={eye_tracker.EXT_FY:.1f})."
+    )
 
     aruco_tracker = (
         aruco_screen.ArucoScreenTracker(
@@ -261,27 +298,27 @@ def run(
     )
     pose_mapper = None
     head_pose_enabled = False
+    fov_screen_enabled = (
+        ENABLE_FOV_SCREEN_MAPPING and aruco_tracker is not None
+    )
     if aruco_tracker is not None:
         if aruco_tracker.camera_calibrated:
             print(
-                "Front camera calibration loaded "
-                f"(RMS {aruco_tracker.camera_calibration_rms:.3f}px)."
+                "Front camera chessboard calibration loaded "
+                f"(RMS {aruco_tracker.camera_calibration_rms:.3f}px) "
+                "for ArUco pose; gaze→front still uses FOV "
+                f"{FRONT_FOV_DEG:.0f}°."
             )
-            if ENABLE_HEAD_POSE_MAPPING:
-                pose_mapper = aruco_screen.GazePoseMapper(eye_ids=active_eyes)
-                head_pose_enabled = True
-                print(
-                    "Head compensation 6DoF: ON (per-eye). "
-                    "Fissa ogni target ~1s con ≥3 marker, poi premi C/frecce (niente freeze)."
-                )
-            else:
-                print("Head compensation 6DoF: OFF by flag.")
-        else:
+        if ENABLE_HEAD_POSE_MAPPING and aruco_tracker.camera_calibrated:
+            pose_mapper = aruco_screen.GazePoseMapper(eye_ids=active_eyes)
+            head_pose_enabled = True
+            print("Head compensation 6DoF: ON (legacy delta path).")
+        if fov_screen_enabled:
             print(
-                "Front camera not calibrated: 6DoF stays OFF. "
-                "Run calibrate_front_camera.py, then retry."
+                "Screen mapping: FOV + ArUco. Premi C guardando il CENTRO "
+                "monitor (link IR↔front), tieni 4 marker visibili."
             )
-    if not head_pose_enabled:
+    if not fov_screen_enabled and not head_pose_enabled:
         print("Using static 5-point mapping. Keep head still after calibration.")
 
     pose_history = PoseGazeHistory()
@@ -311,8 +348,13 @@ def run(
                 if ret_ext:
                     fh, fw = ext_frame.shape[:2]
                     if fw != eye_tracker.EXT_WIDTH or fh != eye_tracker.EXT_HEIGHT:
-                        eye_tracker.configure_external_viewport(fw, fh)
+                        eye_tracker.configure_external_viewport(
+                            fw,
+                            fh,
+                            fov_deg=FRONT_FOV_DEG,
+                        )
                     if aruco_tracker is not None:
+                        # ArUco pose keeps chessboard K if loaded; gaze uses FOV.
                         aruco_tracker.configure_camera(
                             fw,
                             fh,
@@ -329,6 +371,16 @@ def run(
                     if aruco_tracker is not None:
                         display = aruco_tracker.process(display)
 
+                    if eye_tracker.calibrated:
+                        eye_tracker.update_gaze_circle_from_current_gaze()
+                        cv2.circle(
+                            display,
+                            (int(eye_tracker.circle_x), int(eye_tracker.circle_y)),
+                            8,
+                            (0, 0, 255),
+                            -1,
+                        )
+
                     if flip_front:
                         display = cv2.flip(display, 0)
                     if mirror_front:
@@ -337,29 +389,68 @@ def run(
                 elif aruco_tracker is not None:
                     aruco_tracker.ready = False
                     aruco_tracker.pose_ready = False
+                    aruco_tracker.homography = None
 
             pose_history.push(fusion_eyes, aruco_tracker)
             eye_tracker.pump_gl_sphere_events()
 
             ir_calibrating = heatmap_session.calibrating
             pose_available = aruco_tracker is not None and aruco_tracker.pose_ready
-            pose_calibrated = pose_mapper is not None and pose_mapper.calibrated
+            pose_calibrated = pose_mapper is not None and pose_mapper.anchored_ready
+            aruco_available = aruco_tracker is not None and aruco_tracker.ready
+            homography_ready = (
+                aruco_tracker is not None and aruco_tracker.homography is not None
+            )
+            use_fov_mapping = (
+                fov_screen_enabled
+                and eye_tracker.calibrated
+                and homography_ready
+                and combined_gaze is not None
+            )
             use_pose_mapping = (
                 head_pose_enabled
                 and heatmap_session.mapping_ready
                 and pose_calibrated
                 and pose_available
+                and not use_fov_mapping
             )
-            use_calibrated_mapping = heatmap_session.mapping_ready and not use_pose_mapping
-            aruco_available = aruco_tracker is not None and aruco_tracker.ready
+            use_calibrated_mapping = (
+                heatmap_session.mapping_ready
+                and not use_fov_mapping
+                and not use_pose_mapping
+            )
 
-            if use_pose_mapping:
+            fov_status = None
+            if use_fov_mapping:
+                ok, fov_status = heatmap_session.update_via_aruco(
+                    combined_gaze,
+                    aruco_tracker.homography,
+                    eye_tracker.R_gaze_to_cam,
+                    eye_tracker.EXT_WIDTH,
+                    eye_tracker.EXT_HEIGHT,
+                    eye_tracker.EXT_CX,
+                    eye_tracker.EXT_CY,
+                    eye_tracker.EXT_FX,
+                    eye_tracker.EXT_FY,
+                )
+                if not ok:
+                    if fov_status == "off_screen":
+                        heatmap_session.last_point = None
+                    elif heatmap_session.mapping_ready:
+                        heatmap_session.update(combined_gaze)
+            elif use_pose_mapping:
+                static_point = heatmap_session.project_to_screen(combined_gaze)
                 gaze_by_eye = _current_eye_gazes(fusion_eyes)
-                pose_point = pose_mapper.project(gaze_by_eye, aruco_tracker)
+                pose_point = pose_mapper.project_anchored(
+                    gaze_by_eye,
+                    aruco_tracker,
+                    static_point,
+                )
                 if pose_point is not None:
                     heatmap_session.update_screen_point(pose_point)
+                elif static_point is not None:
+                    heatmap_session.update_screen_point(static_point)
                 else:
-                    # Prefer static fallback over writing nothing / freezing.
                     heatmap_session.update(combined_gaze)
             else:
                 heatmap_session.update(combined_gaze)
@@ -372,9 +463,30 @@ def run(
                 camera_status["front"] = front_reader.snapshot_status()
 
             hud_extra_lines = []
-            if use_pose_mapping:
+            if use_fov_mapping:
+                if fov_status == "off_screen":
+                    hud_extra_lines.append(
+                        f"Mapping: FOV {FRONT_FOV_DEG:.0f}°+ArUco | FUORI SCHERMO | "
+                        f"{_format_fusion_status(fusion_eyes, active_eyes)}"
+                    )
+                else:
+                    hud_extra_lines.append(
+                        f"Mapping: FOV {FRONT_FOV_DEG:.0f}°+ArUco (front→monitor) | "
+                        f"{_format_fusion_status(fusion_eyes, active_eyes)}"
+                    )
+            elif fov_screen_enabled and not eye_tracker.calibrated:
                 hud_extra_lines.append(
-                    f"Mapping: ArUco 6DoF per-occhio | "
+                    "Mapping: premi C al CENTRO (link IR↔front, FOV 60°) | "
+                    f"{_format_fusion_status(fusion_eyes, active_eyes)}"
+                )
+            elif fov_screen_enabled and eye_tracker.calibrated and not homography_ready:
+                hud_extra_lines.append(
+                    "Mapping: FOV OK, serve omografia ArUco (4 marker) | "
+                    f"{_format_fusion_status(fusion_eyes, active_eyes)}"
+                )
+            elif use_pose_mapping:
+                hud_extra_lines.append(
+                    f"Mapping: statico + delta testa 6DoF | "
                     f"{_format_fusion_status(fusion_eyes, active_eyes)}"
                 )
             elif pose_calibrated and not pose_available:
@@ -398,8 +510,13 @@ def run(
                     f"Mapping: premi C + frecce | "
                     f"{_format_fusion_status(fusion_eyes, active_eyes)}"
                 )
+            if fov_screen_enabled:
+                hud_extra_lines.append(
+                    f"FOV front {FRONT_FOV_DEG:.0f}° | IR↔front: "
+                    f"{'OK' if eye_tracker.calibrated else 'premi C'}"
+                )
             if head_pose_enabled:
-                hud_extra_lines.append("Compensazione testa 6DoF: ON (per-occhio)")
+                hud_extra_lines.append("Compensazione testa 6DoF: ON (delta su statico)")
             else:
                 hud_extra_lines.append("Compensazione testa 6DoF: OFF")
             hud_extra_lines.append(camera_panel.status_line())
@@ -448,10 +565,16 @@ def run(
                 if calibration_gaze is None:
                     print("No combined gaze vector yet.")
                 else:
-                    eye_tracker.calibrated = False
+                    # Link IR gaze space to front-camera forward (FOV 60).
+                    eye_tracker.calibrate_gaze_to_external(fusion_eyes)
                     saved, message = heatmap_session.set_center_calibration(calibration_gaze)
                     eye_tracker.reset_gaze_smoothing()
                     print(message)
+                    if fov_screen_enabled:
+                        print(
+                            f"IR↔front link OK (FOV {FRONT_FOV_DEG:.0f}°). "
+                            "Tieni i marker ArUco visibili per mappare sullo schermo."
+                        )
                     if saved and pose_mapper is not None:
                         pose_mapper.reset()
                         pose_message = _record_pose_sample_from_history(
@@ -497,6 +620,7 @@ def run(
                 print(f"Saved {out_path}")
             elif key == ord("0"):
                 fusion_eyes = active_eyes
+                eye_tracker.calibrated = False
                 eye_tracker.reset_gaze_smoothing()
                 heatmap_session.reset_calibration()
                 heatmap_session.reset_heatmap()
@@ -506,6 +630,7 @@ def run(
                 print("Gaze fusion: both eyes. Calibrazione resettata: premi C.")
             elif key == ord("1") and "left" in active_eyes:
                 fusion_eyes = ("left",)
+                eye_tracker.calibrated = False
                 eye_tracker.reset_gaze_smoothing()
                 heatmap_session.reset_calibration()
                 heatmap_session.reset_heatmap()
@@ -515,6 +640,7 @@ def run(
                 print("Gaze fusion: LEFT eye only. Calibrazione resettata: premi C.")
             elif key == ord("2") and "right" in active_eyes:
                 fusion_eyes = ("right",)
+                eye_tracker.calibrated = False
                 eye_tracker.reset_gaze_smoothing()
                 heatmap_session.reset_calibration()
                 heatmap_session.reset_heatmap()
