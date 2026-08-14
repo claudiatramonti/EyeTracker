@@ -3,7 +3,7 @@ Front-camera ArUco screen pose (no IR / gaze / heatmap).
 
 PnP from four corner markers → camera position and orientation vs the screen.
 
-Object frame (mm): origin = window center, X right, Y down, Z into the screen.
+Object frame (mm): origin = window center, X right, Y up, Z into the screen.
 Camera is on the viewer side (negative Z), looking toward +Z.
 
 Markers (DICT_4X4_50): 0 top-left, 1 top-right, 2 bottom-right, 3 bottom-left.
@@ -15,7 +15,7 @@ HUD (how each value is computed):
   C            camera pos = -R.T @ t   (solvePnP: P_cam = R @ P_obj + t)
   look         R.T @ [0, 0, 1]
   yaw          atan2(look_x, look_z)                    degrees, +right
-  pitch        atan2(-look_y, hypot(look_x, look_z))    degrees, +up
+  pitch        atan2(look_y, hypot(look_x, look_z))     degrees, +up
   roll         atan2(cam_up·right, cam_up·up)           degrees, +clockwise
   dist         abs(C_z) mm  (distance to the screen plane)
   incidenza    acos(clip(look · [0,0,1]))               degrees, 0 = square-on
@@ -146,9 +146,9 @@ def camera_matrix(width, height, hfov_deg):
 
 
 def pixel_to_mm(px, py, width_px, height_px, width_mm, height_mm):
-    """Pixel (top-left origin) → object mm: x = px/W * Wmm - Wmm/2, z = 0."""
+    """Pixel (top-left origin) → object mm (Y up): top row → +Y mm."""
     x = (float(px) / width_px) * width_mm - 0.5 * width_mm
-    y = (float(py) / height_px) * height_mm - 0.5 * height_mm
+    y = (0.5 - float(py) / height_px) * height_mm
     return np.array([x, y, 0.0], dtype=np.float64)
 
 
@@ -174,7 +174,7 @@ def pose_from_rt(rotation, translation):
       C    = -R.T @ t                         camera position in screen mm
       look = R.T @ [0,0,1]                    optical axis in screen coords
       yaw  = atan2(look_x, look_z)            deg, +right
-      pitch= atan2(-look_y, hypot(look_x,z))  deg, +up
+      pitch= atan2(look_y, hypot(look_x,z))     deg, +up
       roll = atan2(up·right, up·plane_up)     deg, +clockwise
       dist = abs(C_z)                         mm to screen plane
       inc  = acos(look · [0,0,1])             deg vs screen normal
@@ -188,7 +188,7 @@ def pose_from_rt(rotation, translation):
         look_dir = look_dir / look_norm
 
     yaw_deg = math.degrees(math.atan2(look_dir[0], look_dir[2]))
-    pitch_deg = math.degrees(math.atan2(-look_dir[1], math.hypot(look_dir[0], look_dir[2])))
+    pitch_deg = math.degrees(math.atan2(look_dir[1], math.hypot(look_dir[0], look_dir[2])))
 
     cam_up = rotation.T @ np.array([0.0, -1.0, 0.0])
     plane_right = np.array([look_dir[2], 0.0, -look_dir[0]])
@@ -389,10 +389,10 @@ class CornerMarkers:
         half_h = 0.5 * height_mm
         return np.array(
             [
-                [-half_w, -half_h, 0.0],
-                [half_w, -half_h, 0.0],
-                [half_w, half_h, 0.0],
                 [-half_w, half_h, 0.0],
+                [half_w, half_h, 0.0],
+                [half_w, -half_h, 0.0],
+                [-half_w, -half_h, 0.0],
             ],
             dtype=np.float64,
         )

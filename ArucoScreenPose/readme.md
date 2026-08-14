@@ -59,7 +59,7 @@ A wrong physical screen size mostly affects distance, not yaw/pitch/roll.
 
 ## Angles
 
-Object frame: origin at window centre, **X right**, **Y down**, **Z into the screen**.
+Object frame: origin at window centre, **X right**, **Y up**, **Z into the screen**.
 The front camera is on the viewer side (negative Z).
 
 | Value | Meaning |
