@@ -571,14 +571,14 @@ class ScreenPoseTracker:
             color = (0, 255, 0)
         elif self.corner_ids_found:
             lines.append(
-                f"ArUco: {len(self.corner_ids_found)}/4 angoli (servono almeno {MIN_MARKERS_FOR_POSE})"
+                f"ArUco: {len(self.corner_ids_found)}/4 angles (at least {MIN_MARKERS_FOR_POSE})"
             )
             color = (0, 255, 255)
         elif self.markers_found:
-            lines.append(f"ArUco: {self.markers_found} marker, servono ID 0-3")
+            lines.append(f"ArUco: {self.markers_found} marker, ID 0-3 are needed")
             color = (0, 165, 255)
         else:
-            lines.append("ArUco: nessun marker — punta la frontale allo schermo")
+            lines.append("ArUco: no marker, point the front camera at the screen")
             color = (0, 0, 255)
 
         y = 24
@@ -596,7 +596,7 @@ class ScreenPoseTracker:
             )
         if self.corner_ids_found:
             return f"ArUco {len(self.corner_ids_found)}/4"
-        return "ArUco: in attesa"
+        return "ArUco: waiting..."
 
 
 def fit_frame(frame, width, height):

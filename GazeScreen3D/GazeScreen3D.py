@@ -436,9 +436,9 @@ def run(choice):
                 tracker.status_line() if hasattr(tracker, "status_line") else "",
             ]
             if eye_tracker.calibrated:
-                lines.append("Gaze→cam: calibrated (C)")
+                lines.append("Gaze to cam: calibrated (C)")
             else:
-                lines.append("Gaze→cam: press C while looking at SCREEN CENTER")
+                lines.append("Gaze to cam: press C while looking at SCREEN CENTER")
             lines.append(
                 "Eye center: LOCKED (U unlock)" if locked_any else "Eye center: auto (click IR preview to lock)"
             )
@@ -447,9 +447,9 @@ def run(choice):
                 state = "ON screen" if hit["on_screen"] else "OFF screen"
                 lines.append(f"Hit {state}  ({hit['u']:.0f}, {hit['v']:.0f}) px")
             elif not tracker.ready:
-                lines.append("Waiting for ArUco screen pose…")
+                lines.append("Waiting for ArUco screen pose...")
             elif not eye_tracker.calibrated:
-                lines.append("Waiting for C calibration…")
+                lines.append("Waiting for C calibration...")
             else:
                 lines.append("No gaze / no intersection")
 
