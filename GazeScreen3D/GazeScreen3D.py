@@ -181,6 +181,21 @@ def fit_frame(frame, width, height):
     return canvas, ox, oy, nw, nh
 
 
+def maximize_cv_window(window_name):
+    """Maximize OpenCV window on Windows (call after first imshow)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, window_name)
+        if hwnd:
+            user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+    except (AttributeError, OSError):
+        pass
+
+
 def lock_eye_sphere_center(eye_id, frame_x, frame_y):
     """Click on IR preview: lock 2D eyeball center (does not replace C gaze→cam)."""
     eye_tracker.load_eye_tracking_state(eye_id)
@@ -290,6 +305,10 @@ def run(choice):
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.moveWindow(WINDOW_NAME, win_x, win_y)
     cv2.resizeWindow(WINDOW_NAME, screen_w, screen_h)
+    # Create the window handle, then maximize (resizeWindow alone stays small on Windows).
+    cv2.imshow(WINDOW_NAME, np.zeros((screen_h, screen_w, 3), dtype=np.uint8))
+    cv2.waitKey(1)
+    maximize_cv_window(WINDOW_NAME)
     cv2.setMouseCallback(WINDOW_NAME, make_mouse_handler(layout_state))
 
     show_previews = True
