@@ -47,21 +47,38 @@ def rotation_from_a_to_b(a, b):
     return (np.eye(3) + k * s + (k @ k) * ((1.0 - c) / (s * s))).astype(np.float64)
 
 
-def gaze_dir_in_cam(gaze_dir_eye, R_gaze_to_cam, opencv_y_down=True):
+def gaze_dir_in_cam(gaze_dir_eye, R_gaze_to_cam, opencv_y_down=True, scale_x=1.0, scale_y=1.0):
     """
     Map eye gaze to front-camera direction.
 
     eye_tracker uses Y-up gaze space; R from C is ~identity when looking forward.
     Pinhole preview uses ``cy - fy * g[1]`` (projection space, Y-up).
     3D ray ∩ plane needs OpenCV camera coords (Y down) → flip g[1] when requested.
+    Optional scale_x/scale_y refine yaw/pitch in OpenCV (Y-down) space after R.
     """
     if gaze_dir_eye is None or R_gaze_to_cam is None:
         return None
     g = np.asarray(R_gaze_to_cam, dtype=np.float64) @ np.asarray(gaze_dir_eye, dtype=np.float64)
+    # Always flip to OpenCV Y-down for optional scale (edge calib fitted there).
+    g_cv = np.asarray(g, dtype=np.float64).copy()
+    g_cv[1] = -g_cv[1]
+    g_cv = normalize(g_cv)
+    if g_cv is None:
+        return None
+
+    sx, sy = float(scale_x), float(scale_y)
+    if abs(sx - 1.0) > 1e-6 or abs(sy - 1.0) > 1e-6:
+        from gaze_scale_calib import apply_yaw_pitch_scale
+
+        g_cv = apply_yaw_pitch_scale(g_cv, sx, sy)
+        if g_cv is None:
+            return None
+
     if opencv_y_down:
-        g = g.copy()
-        g[1] = -g[1]
-    return normalize(g)
+        return g_cv
+    out = g_cv.copy()
+    out[1] = -out[1]
+    return out
 
 
 def screen_plane_in_camera(rotation, translation):
@@ -122,12 +139,16 @@ def gaze_to_screen(
     width_px,
     height_px,
     eye_origin_cam=None,
+    scale_x=1.0,
+    scale_y=1.0,
 ):
     """
     Full chain: eye gaze → front-cam direction → hit screen plane → pixel.
 
     eye_origin_cam defaults to front-camera optical center (0,0,0), same
     approximation as the classic pinhole gaze dot.
+
+    scale_x / scale_y: optional yaw/pitch refinement from edge arrow calib.
 
     Returns dict with keys:
       on_screen (bool), u, v (float pixels), point_mm, point_cam, direction_cam
@@ -136,7 +157,13 @@ def gaze_to_screen(
     if gaze_dir_eye is None or R_gaze_to_cam is None or rotation is None or translation is None:
         return None
 
-    direction_cam = gaze_dir_in_cam(gaze_dir_eye, R_gaze_to_cam, opencv_y_down=True)
+    direction_cam = gaze_dir_in_cam(
+        gaze_dir_eye,
+        R_gaze_to_cam,
+        opencv_y_down=True,
+        scale_x=scale_x,
+        scale_y=scale_y,
+    )
     if direction_cam is None:
         return None
 
@@ -166,11 +193,28 @@ def gaze_to_screen(
     }
 
 
-def project_gaze_to_front_pixels(gaze_dir_eye, R_gaze_to_cam, width, height, fx, fy, cx=None, cy=None):
+def project_gaze_to_front_pixels(
+    gaze_dir_eye,
+    R_gaze_to_cam,
+    width,
+    height,
+    fx,
+    fy,
+    cx=None,
+    cy=None,
+    scale_x=1.0,
+    scale_y=1.0,
+):
     """Debug: same pinhole as FrontCameraTracker (red dot on front feed)."""
     if gaze_dir_eye is None or R_gaze_to_cam is None:
         return None
-    g = gaze_dir_in_cam(gaze_dir_eye, R_gaze_to_cam, opencv_y_down=False)
+    g = gaze_dir_in_cam(
+        gaze_dir_eye,
+        R_gaze_to_cam,
+        opencv_y_down=False,
+        scale_x=scale_x,
+        scale_y=scale_y,
+    )
     if g is None or g[2] <= 1e-6:
         return None
     if cx is None:

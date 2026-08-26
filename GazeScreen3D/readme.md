@@ -8,8 +8,10 @@ Does not depend on `HeatMapFrontCameraTracker`. Reuses `ArucoScreenPose` for scr
 
 1. IR camera(s) → 3D gaze direction (pupil / eye sphere)
 2. Press **C** looking at **screen center** → `R_gaze_to_cam` (eye space → front camera)
-3. Front camera + corner ArUco → screen plane in front-camera coords (`R`, `t`)
-4. Ray from camera origin along rotated gaze ∩ plane → `(u, v)` on the monitor  
+3. *(Optional)* Look at each screen edge and press **arrow keys** → yaw/pitch scales
+   refine the eye→cam direction (does **not** replace ArUco mapping)
+4. Front camera + corner ArUco → screen plane in front-camera coords (`R`, `t`)
+5. Ray from camera origin along rotated gaze ∩ plane → `(u, v)` on the monitor  
    (or **off-screen** if the hit is outside the window)
 
 ## Run
@@ -26,6 +28,8 @@ Select left IR (optional right), and front camera.
 | Key | Action |
 |-----|--------|
 | **C** | Calibrate: look at physical screen center |
+| **↑ ↓ ← →** | Optional edge samples (refine yaw/pitch scale after C) |
+| **E** | Reset edge scales (`sx=sy=1`), keep C |
 | **click IR** | Lock eyeball center on that eye preview |
 | **U** | Unlock eye centers (auto-track again) |
 | **M** | Toggle corner ArUco markers |
@@ -37,9 +41,14 @@ Select left IR (optional right), and front camera.
 
 ## Setup
 
+0. *(Optional)* Chessboard calib tool lives in `ArucoScreenPose/calibrate_front_camera.py`.
+   Loading of `front_camera.npz` is **off by default** for now (HFOV 60° + `-`/`+`).
 1. Point the front camera at this window until HUD shows ArUco pose OK (3+/4 corners).
 2. Look at the **center of the monitor** and press **C**.
-3. Look around; green crosshair = on screen, heatmap accumulates.
+3. *(Optional)* Look at top / bottom / left / right edges and press the matching arrow.
+   Yellow crosses = pending, green = sampled. Scales help edge accuracy; ArUco still
+   handles head motion.
+4. Look around; green crosshair = on screen, heatmap accumulates.
 
 IR eye model uses **80° vertical FOV** (`IR_FOV_Y_DEG` in `eye_tracker.py`, GC0308). Re-press **C** after changing it.
 
@@ -52,8 +61,10 @@ If the cyan screen outline on the front preview is wrong, adjust HFOV with **-**
 | `GazeScreen3D.py` | GUI + main loop |
 | `eye_tracker.py` | IR pupil / gaze (Orlosky model, `IR_FOV_Y_DEG=80` for GC0308) |
 | `ray_screen.py` | Gaze→cam rotation helpers + ray∩plane + mm→pixel |
+| `gaze_scale_calib.py` | Optional edge yaw/pitch scales after C |
 | `heatmap.py` | Accumulation + color map |
 | `camera_io.py` | USB capture thread |
+| `../ArucoScreenPose/calibrate_front_camera.py` | Chessboard tool (opt-in via `use_calib=True`) |
 
 ## Math (short)
 
