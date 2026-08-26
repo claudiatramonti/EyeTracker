@@ -10,7 +10,7 @@ Markers (DICT_4X4_50): 0 top-left, 1 top-right, 2 bottom-right, 3 bottom-left.
 
 HUD (how each value is computed):
   fps          frames / elapsed_seconds over a 1s window
-  HFOV         assumed; fx = 0.5 * width / tan(hfov/2)
+  HFOV         assumed fallback; or from calib fx when front_camera.npz is present
   schermo mm   GetDeviceCaps mm * (window_px / monitor_px), else px * 25.4/96
   C            camera pos = -R.T @ t   (solvePnP: P_cam = R @ P_obj + t)
   look         R.T @ [0, 0, 1]
@@ -46,9 +46,11 @@ POSE_SMOOTH_ALPHA = 0.35  # exponential blend of R, t across frames
 MAX_REPROJ_ERROR_PX = 12.0  # reject pose if mean reprojection exceeds this
 MIN_MARKERS_FOR_POSE = 3  # minimum corner IDs (0-3) to run PnP
 
-MARKER_SIZE_DIVISOR = 5
-MARKER_SIZE_MIN = 180
-MARKER_SIZE_MAX = 480
+# On-screen corner markers for GazeScreen3D / ArucoScreenPose:
+# ~12.5% of shorter screen edge (min 80px, max 160px).
+MARKER_SIZE_DIVISOR = 8
+MARKER_SIZE_MIN = 80
+MARKER_SIZE_MAX = 160
 
 
 def detect_cameras(max_cams=6):
@@ -137,12 +139,10 @@ def get_screen_mm(window_width, window_height):
 
 
 def camera_matrix(width, height, hfov_deg):
-    """K from assumed HFOV: fx = 0.5 * width / tan(hfov/2), fy = fx, cx/cy = center."""
-    fx = 0.5 * width / math.tan(math.radians(hfov_deg) * 0.5)
-    fy = fx
-    cx = width * 0.5
-    cy = height * 0.5
-    return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    """K from assumed HFOV (fallback when no chessboard calib file)."""
+    from camera_intrinsics import camera_matrix_from_hfov
+
+    return camera_matrix_from_hfov(width, height, hfov_deg)
 
 
 def pixel_to_mm(px, py, width_px, height_px, width_mm, height_mm):
@@ -435,7 +435,18 @@ class CornerMarkers:
 class ScreenPoseTracker:
     """Detect corner markers and estimate camera-vs-screen pose."""
 
-    def __init__(self, screen_width, screen_height, screen_width_mm, screen_height_mm, hfov_deg=DEFAULT_HFOV_DEG):
+    def __init__(
+        self,
+        screen_width,
+        screen_height,
+        screen_width_mm,
+        screen_height_mm,
+        hfov_deg=DEFAULT_HFOV_DEG,
+        intrinsics_path=None,
+        use_calib=False,
+    ):
+        from camera_intrinsics import default_calib_path, load_intrinsics
+
         self.screen_width = screen_width
         self.screen_height = screen_height
         self.screen_width_mm = screen_width_mm
@@ -443,6 +454,22 @@ class ScreenPoseTracker:
         self.hfov_deg = hfov_deg
         self.markers = CornerMarkers(screen_width, screen_height)
         self.object_points = self.markers.object_points_mm(screen_width_mm, screen_height_mm)
+
+        self.intrinsics = None
+        self.intrinsics_source = "hfov"
+        self._dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+        # Opt-in: pass use_calib=True to load camera_calib/front_camera.npz
+        if use_calib:
+            path = intrinsics_path or default_calib_path()
+            loaded = load_intrinsics(path)
+            if loaded is not None:
+                self.intrinsics = loaded
+                self.intrinsics_source = "calib"
+                print(f"Front intrinsics: {loaded['path']}")
+                if "rms" in loaded:
+                    print(f"  calib RMS {loaded['rms']:.4f} px")
+            else:
+                print(f"Front intrinsics: none ({path}) — using HFOV {hfov_deg:.0f}°")
 
         self.ready = False
         self.markers_found = 0
@@ -456,9 +483,29 @@ class ScreenPoseTracker:
         self._translation = None
 
     def set_hfov(self, hfov_deg):
+        """Manual HFOV override (ignored while chessboard calib is loaded)."""
+        if self.intrinsics is not None:
+            print("HFOV keys ignored — using calibrated K/dist (re-run calibrate_front_camera.py to change).")
+            return
         self.hfov_deg = float(np.clip(hfov_deg, 20.0, 120.0))
         self._rvec = None
         self._tvec = None
+
+    def camera_model(self, frame_width, frame_height):
+        """Return (K, dist, source, effective_hfov) for this frame size."""
+        from camera_intrinsics import resolve_camera_model
+
+        k, dist, source, hfov = resolve_camera_model(
+            frame_width,
+            frame_height,
+            self.hfov_deg,
+            intrinsics=self.intrinsics,
+        )
+        self.intrinsics_source = source
+        self._dist_coeffs = dist
+        if source == "calib" and hfov is not None:
+            self.hfov_deg = float(hfov)
+        return k, dist, source, hfov
 
     def process(self, frame):
         """Detect ArUco → PnP → smooth → draw screen outline and axes."""
@@ -500,11 +547,12 @@ class ScreenPoseTracker:
 
         if len(self.corner_ids_found) >= MIN_MARKERS_FOR_POSE and len(object_pts) >= 4:
             h, w = out.shape[:2]
-            camera_k = camera_matrix(w, h, self.hfov_deg)
+            camera_k, dist_coeffs, _, _ = self.camera_model(w, h)
             pose = estimate_screen_pose(
                 object_pts,
                 image_pts,
                 camera_k,
+                dist_coeffs=dist_coeffs,
                 prev_rvec=self._rvec,
                 prev_tvec=self._tvec,
             )
@@ -526,13 +574,17 @@ class ScreenPoseTracker:
                 self.reprojection_error = pose["reprojection_error"]
                 self.angles = pose_from_rt(rotation, translation)
                 self.ready = True
-                self._draw_pose(out, rvec, tvec, camera_k)
+                self._draw_pose(out, rvec, tvec, camera_k, dist_coeffs)
 
         self._draw_status(out)
         return out
 
-    def _draw_pose(self, frame, rvec, tvec, camera_k):
-        dist = np.zeros((5, 1), dtype=np.float64)
+    def _draw_pose(self, frame, rvec, tvec, camera_k, dist_coeffs=None):
+        dist = (
+            np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
+            if dist_coeffs is not None
+            else self._dist_coeffs
+        )
         screen_corners = self.markers.screen_corners_mm(self.screen_width_mm, self.screen_height_mm)
         projected, _ = cv2.projectPoints(screen_corners, rvec, tvec, camera_k, dist)
         pts = projected.reshape(-1, 2).astype(int)
@@ -704,14 +756,27 @@ def draw_hud(frame, tracker, camera_status, extra_lines=None, origin=None):
         status = camera_status.get("status", "?")
         backend = camera_status.get("backend", "?")
         lines.append(f"Front {fps:.0f} fps  [{status}]  {backend}")
-    lines.append(f"HFOV {tracker.hfov_deg:.0f} deg  |  schermo {tracker.screen_width_mm:.0f}x{tracker.screen_height_mm:.0f} mm")
+    source = getattr(tracker, "intrinsics_source", "hfov")
+    if source == "calib":
+        lines.append(
+            f"K calib  HFOV~{tracker.hfov_deg:.0f} deg  |  "
+            f"schermo {tracker.screen_width_mm:.0f}x{tracker.screen_height_mm:.0f} mm"
+        )
+    else:
+        lines.append(
+            f"HFOV {tracker.hfov_deg:.0f} deg  |  "
+            f"schermo {tracker.screen_width_mm:.0f}x{tracker.screen_height_mm:.0f} mm"
+        )
     if tracker.ready and tracker.angles is not None:
         a = tracker.angles
         lines.append(tracker.status_line())
         lines.append(f"incidenza {a['incidence_deg']:.1f} deg   riproj {tracker.reprojection_error:.2f} px")
     else:
         lines.append(tracker.status_line())
-    lines.append("Q esci  |  M marker  |  -/+ FOV  |  0 reset  |  P stampa")
+    if source == "calib":
+        lines.append("Q esci  |  M marker  |  P stampa  (FOV keys off: using calib)")
+    else:
+        lines.append("Q esci  |  M marker  |  -/+ FOV  |  0 reset  |  P stampa")
     if extra_lines:
         lines.extend(extra_lines)
 

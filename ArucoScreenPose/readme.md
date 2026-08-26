@@ -15,6 +15,19 @@ the screen — or that they are looking off-screen.
 
 This folder is only the first piece: **register the screen in the front camera**.
 
+## Front camera calibration (optional, currently disabled in the trackers)
+
+Chessboard tool is available but **not loaded by default** (`use_calib=False`).
+Trackers use assumed HFOV 60° again (keys **-** / **+**).
+
+```bash
+cd ArucoScreenPose
+python calibrate_front_camera.py
+```
+
+To re-enable later, construct `ScreenPoseTracker(..., use_calib=True)` so it loads
+`camera_calib/front_camera.npz`.
+
 ## Run
 
 ```bash
@@ -53,9 +66,9 @@ Point the glasses (or webcam) at this window until the HUD shows `Pose OK 4/4`.
 | **0** | Reset FOV to 60° |
 | **P** | Print current pose to the console |
 
-If the cyan rectangle does not line up with the real monitor in the camera
-image, adjust FOV with **-** / **+** until it does. Wrong FOV warps the angles.
-A wrong physical screen size mostly affects distance, not yaw/pitch/roll.
+If the cyan rectangle does not line up with the real
+monitor, adjust FOV with **-** / **+**. Wrong FOV warps the angles. A wrong
+physical screen size mostly affects distance, not yaw/pitch/roll.
 
 ## Angles
 
@@ -77,6 +90,8 @@ The front camera is on the viewer side (negative Z).
 | `ArucoScreenPose.py` | GUI, camera loop, debug layout |
 | `screen_pose.py` | ArUco detection, `solvePnP` pose, overlays |
 | `camera_io.py` | USB capture thread |
+| `calibrate_front_camera.py` | Chessboard tool → `camera_calib/front_camera.npz` |
+| `camera_intrinsics.py` | Load/save/scale K + dist |
 
 Independent of `HeatMapFrontCameraTracker/`. Same marker IDs (0–3, clockwise from top-left).
 
