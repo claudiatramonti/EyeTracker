@@ -475,6 +475,8 @@ def run(choice):
             lines.append("Q quit | C calib | click IR lock | U unlock | M V K | -/+ FOV")
             draw_hud(canvas, [ln for ln in lines if ln], x=x1, y=36)
 
+            tracker.markers.draw_center(canvas)
+
             cv2.imshow(WINDOW_NAME, canvas)
 
             key = poll_key()

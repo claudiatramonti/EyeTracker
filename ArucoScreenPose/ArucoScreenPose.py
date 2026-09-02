@@ -171,6 +171,7 @@ def compose_view(screen_w, screen_h, tracker, camera_frame, camera_status):
     schematic_h = 150
     schematic_y = screen_h - tracker.markers.margin - schematic_h - 8
     draw_angle_schematic(canvas, tracker.angles, x1, schematic_y, size=schematic_h)
+    tracker.markers.draw_center(canvas)
     return canvas
 
 
