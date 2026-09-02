@@ -9,7 +9,6 @@ import sys
 import time
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-GAZE_VECTOR_PATH = os.path.join(MODULE_DIR, "gaze_vector.txt")
 
 # gl_sphere.py lives in 3DTracker (folder name is not a valid package, so path insert).
 _GL_SPHERE_DIR = os.path.normpath(os.path.join(MODULE_DIR, "..", "3DTracker"))
@@ -26,12 +25,24 @@ except ImportError:
 EYE_IDS = ("left", "right")
 current_eye_id = "left"
 
+# --- Per-eye workspace (stereo via load/save) ---
+# Orlosky tracking was written mono-eye using module globals. For left+right we keep
+# one mutable workspace here and swap it with eye_tracking_states[eye_id] via
+# load_eye_tracking_state / save_eye_tracking_state around each process_frame call.
 ray_lines = []
 model_centers = []
 max_rays = 100
 prev_model_center_avg = (320, 240)
-max_observed_distance = 0
 stored_intersections = []
+
+# Eye-sphere radius (2D px overlay); adapted live from pupil geometry (3DTracker mono).
+max_observed_distance = 0
+last_sphere_radius_ellipse = None
+MIN_MODEL_CENTERS = 30
+PUPIL_CONFIDENCE_THRESHOLD = 0.85
+PUPIL_CONFIDENCE_THRESHOLD_SPHERE = 0.65
+EYE_SPHERE_ADJUSTMENT_ENABLED = True
+EYE_SPHERE_RADIUS_PX = 202  # fallback until adaptation estimates radius
 
 last_sphere_center = None
 last_gaze_dir = None
@@ -59,38 +70,39 @@ EXT_FY = 600.0
 
 # IR module virtual camera FOV (GC0308 ~80°); used in compute_gaze_vector pupil→3D ray
 IR_FOV_Y_DEG = 80.0
-circle_x = EXT_CX
-circle_y = EXT_CY
 
 # Exponential smoothing for fused gaze (heatmap + front-camera dot).
 # Higher alpha = faster response, lower = less jitter.
 GAZE_DIRECTION_SMOOTH_ALPHA = 0.50
-GAZE_CIRCLE_SMOOTH_ALPHA = 0.35
-smoothed_combined_gaze_dir = None
-_smoothed_circle_u = None
-_smoothed_circle_v = None
+
+# Smoothed combined gaze direction from both left and right eyes
+smoothed_combined_gaze_dir = None 
 
 # When False, tracking runs silently and stores preview_frame for heatmap PiP.
 show_separate_tracking_windows = False
 
 
 def create_eye_tracking_state():
+    """Return a fresh per-eye state dict (defaults only; does not touch globals).
+    This function is called at start of module to create an empty dictionary for each eye.
+    """
     return {
-        "ray_lines": [],
-        "model_centers": [],
-        "prev_model_center_avg": (320, 240),
-        "max_observed_distance": 0,
-        "stored_intersections": [],
-        "last_sphere_center": None,
-        "last_gaze_dir": None,
-        "calibrated_sphere_center": None,
-        "sphere_center_locked_2d": False,
-        "locked_model_center_avg": (320, 240),
-        "gaze_output": [0.0] * 6,
-        "preview_frame": None,
+        "ray_lines": [],  # pupil ellipse history -> ray intersections for eye center
+        "model_centers": [],  # rolling 2D eye-center samples (auto-track mode)
+        "prev_model_center_avg": (320, 240),  # last good 2D center if a frame fails
+        "stored_intersections": [],  # accumulated ray-ray hits for center estimate
+        "last_sphere_center": None,  # latest 3D eye origin (Orlosky sphere center)
+        "last_gaze_dir": None,  # latest 3D gaze unit vector for this eye
+        "calibrated_sphere_center": None,  # frozen 3D origin after IR click-lock
+        "sphere_center_locked_2d": False,  # True = stop auto-updating 2D center
+        "locked_model_center_avg": (320, 240),  # fixed 2D center while locked
+        "max_observed_distance": 0,  # adaptive eye-sphere radius (px)
+        "last_sphere_radius_ellipse": None,  # last pupil ellipse that grew radius
+        "preview_frame": None,  # last annotated IR frame for GazeScreen3D PiP
     }
 
 
+# Persistent storage: one state dict per eye (survives across left/right alternation).
 eye_tracking_states = {
     eye_id: create_eye_tracking_state()
     for eye_id in EYE_IDS
@@ -102,47 +114,57 @@ def eye_window_name(base_name):
 
 
 def load_eye_tracking_state(eye_id):
+    """Copy eye_tracking_states[eye_id] -> module globals (activate this eye's workspace).
+    This function is called at start of each process_frame to activate the eye's workspace.
+    """
     global current_eye_id
-    global ray_lines, model_centers, prev_model_center_avg, max_observed_distance
+    global ray_lines, model_centers, prev_model_center_avg
     global stored_intersections, last_sphere_center, last_gaze_dir
     global calibrated_sphere_center, sphere_center_locked_2d, locked_model_center_avg
+    global max_observed_distance, last_sphere_radius_ellipse
 
     current_eye_id = eye_id
     state = eye_tracking_states[eye_id]
     ray_lines = state["ray_lines"]
     model_centers = state["model_centers"]
     prev_model_center_avg = state["prev_model_center_avg"]
-    max_observed_distance = state["max_observed_distance"]
     stored_intersections = state["stored_intersections"]
     last_sphere_center = state["last_sphere_center"]
     last_gaze_dir = state["last_gaze_dir"]
     calibrated_sphere_center = state["calibrated_sphere_center"]
     sphere_center_locked_2d = state["sphere_center_locked_2d"]
     locked_model_center_avg = state["locked_model_center_avg"]
+    max_observed_distance = state["max_observed_distance"]
+    last_sphere_radius_ellipse = state["last_sphere_radius_ellipse"]
 
 
 def save_eye_tracking_state(eye_id):
+    """Copy module globals -> eye_tracking_states[eye_id] (persist after processing).
+    This function is called at end of each process_frame to persist the eye's workspace.
+    """
     state = eye_tracking_states[eye_id]
     state["ray_lines"] = ray_lines
     state["model_centers"] = model_centers
     state["prev_model_center_avg"] = prev_model_center_avg
-    state["max_observed_distance"] = max_observed_distance
     state["stored_intersections"] = stored_intersections
     state["last_sphere_center"] = last_sphere_center
     state["last_gaze_dir"] = last_gaze_dir
     state["calibrated_sphere_center"] = calibrated_sphere_center
     state["sphere_center_locked_2d"] = sphere_center_locked_2d
     state["locked_model_center_avg"] = locked_model_center_avg
+    state["max_observed_distance"] = max_observed_distance
+    state["last_sphere_radius_ellipse"] = last_sphere_radius_ellipse
 
 
 def reset_eye_tracking_state(eye_id):
+    """Wipe one eye's stored state (GazeScreen3D calls this at startup per IR camera)."""
     eye_tracking_states[eye_id] = create_eye_tracking_state()
-    write_gaze_vector_file()
     if current_eye_id == eye_id:
         load_eye_tracking_state(eye_id)
 
 
 def get_eye_gaze_dir(eye_id):
+    """Read fused gaze for one eye from persistent state (safe without load/save)."""
     direction = eye_tracking_states[eye_id]["last_gaze_dir"]
     if direction is None:
         return None
@@ -154,6 +176,14 @@ def get_eye_gaze_dir(eye_id):
 
 
 def combine_gaze_directions(*directions):
+    """
+    Fuse per-eye unit gaze vectors in a single 3D vector: normalize each, sum, re-normalize.
+    Equivalent to averaging directions in 3D. Skips None/invalid inputs;
+    with one valid eye, returns that eye alone.
+
+    ALTERNATIVE: calculate the gaze direction from each eye separately 
+    and then average the results after the projection to the screen.
+    """
     valid = []
     for direction in directions:
         if direction is None:
@@ -174,16 +204,14 @@ def combine_gaze_directions(*directions):
         return valid[0]
     return combined / norm
 
-
+# Reset the smoothed combined gaze direction
 def reset_gaze_smoothing():
-    global smoothed_combined_gaze_dir, _smoothed_circle_u, _smoothed_circle_v
+    global smoothed_combined_gaze_dir
     smoothed_combined_gaze_dir = None
-    _smoothed_circle_u = None
-    _smoothed_circle_v = None
-
 
 def smooth_combined_gaze(direction, alpha=GAZE_DIRECTION_SMOOTH_ALPHA):
-    """EMA on the fused unit gaze direction; holds last value when tracking drops."""
+    """Exponential moving average on the fused unit gaze direction; holds last value when tracking drops.
+    """
     global smoothed_combined_gaze_dir
 
     if direction is None:
@@ -209,6 +237,9 @@ def smooth_combined_gaze(direction, alpha=GAZE_DIRECTION_SMOOTH_ALPHA):
 
 
 def refresh_combined_gaze(active_eyes=EYE_IDS):
+    """Refresh the combined gaze direction by combining the gaze directions from both eyes.
+    This function is called by GazeScreen3D to update the combined gaze direction each frame.
+    """
     global combined_gaze_dir, last_gaze_dir
 
     directions = [get_eye_gaze_dir(eye_id) for eye_id in active_eyes]
@@ -218,57 +249,42 @@ def refresh_combined_gaze(active_eyes=EYE_IDS):
 
 
 def get_combined_gaze_dir():
+    """Return the smoothed combined gaze direction (smoothed by the exponential moving average).
+    This function is called by GazeScreen3D to get the combined gaze direction for the current frame.
+    """
     if smoothed_combined_gaze_dir is not None:
         return smoothed_combined_gaze_dir
     return combined_gaze_dir if combined_gaze_dir is not None else last_gaze_dir
 
 
 def get_raw_combined_gaze_dir():
+    """Return the raw combined gaze direction (not smoothed).
+    This function is called by GazeScreen3D to get the raw combined gaze direction for the current frame.
+    """
     return combined_gaze_dir if combined_gaze_dir is not None else last_gaze_dir
 
 
-def write_gaze_vector_file():
-    file_path = GAZE_VECTOR_PATH
-
-    def is_file_available(path):
-        try:
-            with open(path, "a"):
-                return True
-        except IOError:
-            return False
-
-    if not is_file_available(file_path):
-        print("File is currently in use. Skipping write.")
-        return
-
-    try:
-        values = eye_tracking_states["left"]["gaze_output"] + eye_tracking_states["right"]["gaze_output"]
-        csv_line = ",".join(f"{value:.6f}" for value in values)
-        with open(file_path, "w") as f:
-            f.write(csv_line + "\n")
-    except Exception as e:
-        print("Write error:", e)
-
-
-def update_eye_gaze_output(eye_id, sphere_center, gaze_direction):
-    all_values = np.concatenate((sphere_center, gaze_direction))
-    eye_tracking_states[eye_id]["gaze_output"] = [float(value) for value in all_values]
-    write_gaze_vector_file()
-
-
 def configure_external_viewport(width, height):
-    global EXT_WIDTH, EXT_HEIGHT, EXT_CX, EXT_CY, EXT_FX, EXT_FY, circle_x, circle_y
-
+    """Set the external camera viewport size and focal length.
+    """
+    global EXT_WIDTH, EXT_HEIGHT, EXT_CX, EXT_CY, EXT_FX, EXT_FY
+    
+    # Set the external camera viewport size and focal length
     EXT_WIDTH = max(int(width), 1)
     EXT_HEIGHT = max(int(height), 1)
+
+    # Set the external camera viewport center
     EXT_CX = EXT_WIDTH // 2
     EXT_CY = EXT_HEIGHT // 2
+
+    # Set the external camera viewport focal length
     EXT_FX = 600.0 * (EXT_WIDTH / 640.0)
     EXT_FY = 600.0 * (EXT_HEIGHT / 480.0)
-    circle_x, circle_y = EXT_CX, EXT_CY
 
 
 def open_external_camera(external_index, preferred_width=640, preferred_height=480):
+    """Open the external camera.
+    """
     if external_index is None:
         return None
 
@@ -291,8 +307,10 @@ def open_external_camera(external_index, preferred_width=640, preferred_height=4
     return external_cap
 
 
-# Function to detect available cameras (gentle probe — avoids USB reset storms)
 def detect_cameras(max_cams=6):
+    """Detect available cameras.
+    This function is called by GazeScreen3D to detect available cameras when the module is initialized.
+    """
     available_cameras = []
     for i in range(max_cams):
         cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
@@ -302,8 +320,10 @@ def detect_cameras(max_cams=6):
         time.sleep(0.2)
     return available_cameras
 
-# Crop the image to maintain a specific aspect ratio (width:height) before resizing.
+
 def crop_to_aspect_ratio(image, width=640, height=480):
+    """Crop the image to maintain a specific aspect ratio (width:height) before resizing.
+    """
     current_height, current_width = image.shape[:2]
     desired_ratio = width / height
     current_ratio = current_width / current_height
@@ -321,27 +341,42 @@ def crop_to_aspect_ratio(image, width=640, height=480):
 
     return cv2.resize(cropped_img, (width, height))
 
-# Apply thresholding to an image
 def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
+    """Apply binary thresholding to an image.
+    This means that all pixels with a value less than the threshold are set to 0, 
+    and all pixels with a value greater than the threshold are set to 255.
+    """
     threshold = darkestPixelValue + addedThreshold
     _, thresholded_image = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
     return thresholded_image
 
-# Finds a square area of dark pixels in the image
-def get_darkest_area(image):
-    ignoreBounds = 20
-    imageSkipSize = 10
-    searchArea = 20
-    internalSkipSize = 5
 
+def get_darkest_area(image):
+    """Coarse pupil seed: scan for the darkest 20×20 patch, return its center (x, y).
+
+    Used by process_frame before thresholding. Not the final pupil center, only a starting point
+    for apply_binary_threshold + mask_outside_square.
+
+    WARNING/TODO: slow (Python triple loop). Any dark artifact (lash, shadow, frame edge)
+    can win over the real pupil.
+    """
+    # Step 1: search grid tuning: skip image borders and sample sparsely for speed
+    ignoreBounds = 20       # ignore outer rim (often noisy / vignetting)
+    imageSkipSize = 10      # coarse grid step across the frame
+    searchArea = 20         # window size (px) summed at each grid point
+    internalSkipSize = 5    # subsample inside each window (not every pixel)
+
+    # Step 2: luminance only: pupil is darkest region in IR
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    min_sum = float('inf')
+    min_sum = float("inf")
     darkest_point = None
 
+    # Step 3: walk coarse grid; at each (x,y) score a local window
     for y in range(ignoreBounds, gray.shape[0] - ignoreBounds, imageSkipSize):
         for x in range(ignoreBounds, gray.shape[1] - ignoreBounds, imageSkipSize):
             current_sum = 0
             num_pixels = 0
+            # Step 4: sum gray values inside searchArea×searchArea (lower sum = darker patch)
             for dy in range(0, searchArea, internalSkipSize):
                 if y + dy >= gray.shape[0]:
                     break
@@ -351,73 +386,84 @@ def get_darkest_area(image):
                     current_sum += gray[y + dy][x + dx]
                     num_pixels += 1
 
+            # Step 5: keep the darkest window; center of window = pupil seed
             if current_sum < min_sum and num_pixels > 0:
                 min_sum = current_sum
                 darkest_point = (x + searchArea // 2, y + searchArea // 2)
 
+    # Step 6: (x, y) passed to threshold + 250×250 mask in process_frame
     return darkest_point
 
-# Mask all pixels outside a square defined by center and size
 def mask_outside_square(image, center, size):
+    """Zero everything outside a size x size square centered on center.
+
+    After get_darkest_area, keeps only a local ROI around the pupil seed so
+    threshold/contour steps ignore distant dark blobs (lashes, frame, etc.).
+    """
     x, y = center
     half_size = size // 2
 
+    # Step 1: empty mask (same shape as binary/threshold image)
     mask = np.zeros_like(image)
+    # Step 2: clip square to image bounds (seed near edge → smaller window)
     top_left_x = max(0, x - half_size)
     top_left_y = max(0, y - half_size)
     bottom_right_x = min(image.shape[1], x + half_size)
     bottom_right_y = min(image.shape[0], y + half_size)
+    # Step 3: white = keep pixels inside the square
     mask[top_left_y:bottom_right_y, top_left_x:bottom_right_x] = 255
+    # Step 4: AND with original → outside square becomes black
     return cv2.bitwise_and(image, mask)
 
+
 def optimize_contours_by_angle(contours, image):
+    """Thin pupil contour: drop outward-facing points before ellipse fit.
+
+    Walks the largest contour, keeps points whose local corner bisector points
+    toward the contour centroid (likely true pupil boundary vs glint/spike noise).
+    """
     if len(contours) < 1:
         return contours
 
-    # Holds the candidate points
+    # Step 1: flatten largest contour to N×2 point list
     all_contours = np.concatenate(contours[0], axis=0)
 
-    # Set spacing based on size of contours
-    spacing = int(len(all_contours)/25)  # Spacing between sampled points
+    # Step 2: sample stride ~25 points apart along the closed polygon
+    spacing = int(len(all_contours) / 25)
+    if spacing < 1:
+        spacing = 1
 
     # Temporary array for result
     filtered_points = []
-    
-    # Calculate centroid of the original contours
+
+    # Step 3: centroid of full contour — inward direction reference
     centroid = np.mean(all_contours, axis=0)
-    
-    # Create an image of the same size as the original image
-    point_image = image.copy()
-    
-    skip = 0
-    
-    # Loop through each point in the all_contours array
+
+    # Step 4: test each contour vertex
     for i in range(0, len(all_contours), 1):
     
         # Get three points: current point, previous point, and next point
         current_point = all_contours[i]
+        # neighbors spaced along contour (wrap at ends — contour is closed)
         prev_point = all_contours[i - spacing] if i - spacing >= 0 else all_contours[-spacing]
         next_point = all_contours[i + spacing] if i + spacing < len(all_contours) else all_contours[spacing]
-        
-        # Calculate vectors between points
+
+        # Step 5: edge vectors into current point
         vec1 = prev_point - current_point
         vec2 = next_point - current_point
-        
-        with np.errstate(invalid='ignore'):
-            # Calculate angles between vectors
-            angle = np.arccos(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
 
-        
-        # Calculate vector from current point to centroid
+        # Step 6: vector from vertex toward centroid (inward)
         vec_to_centroid = centroid - current_point
-        
-        # Check if angle is oriented towards centroid
-        # Calculate the cosine of the desired angle threshold (e.g., 80 degrees)
-        cos_threshold = np.cos(np.radians(60))  # Convert angle to radians
-        
-        if np.dot(vec_to_centroid, (vec1+vec2)/2) >= cos_threshold:
+
+        # Step 7: bisector of the two edge directions at this corner
+        bisector = (vec1 + vec2) / 2.0
+
+        # Step 8: keep point if bisector aligns with inward (≥ ~60° cone)
+        cos_threshold = np.cos(np.radians(60))
+        if np.dot(vec_to_centroid, bisector) >= cos_threshold:
             filtered_points.append(current_point)
-    
+
+    # Step 9: back to OpenCV contour format for fitEllipse
     return np.array(filtered_points, dtype=np.int32).reshape((-1, 1, 2))
 
 # Returns the largest contour that is not extremely long or tall
@@ -436,6 +482,70 @@ def filter_contours_by_area_and_return_largest(contours, pixel_thresh, ratio_thr
                     largest_contour = contour
 
     return [largest_contour] if largest_contour is not None else []
+
+
+def distance_to_pupil_outer_edge(eye_center, pupil_ellipse):
+    """Pixel distance from 2D eye center to outer edge of pupil ellipse (3DTracker mono)."""
+    pupil_center, axes, angle_degrees = pupil_ellipse
+    direction_x = pupil_center[0] - eye_center[0]
+    direction_y = pupil_center[1] - eye_center[1]
+    center_distance = math.hypot(direction_x, direction_y)
+
+    semi_axis_x = axes[0] / 2
+    semi_axis_y = axes[1] / 2
+    if center_distance == 0 or semi_axis_x <= 0 or semi_axis_y <= 0:
+        return None
+
+    unit_x = direction_x / center_distance
+    unit_y = direction_y / center_distance
+    angle_radians = math.radians(angle_degrees)
+    cosine = math.cos(angle_radians)
+    sine = math.sin(angle_radians)
+
+    local_x = cosine * unit_x + sine * unit_y
+    local_y = -sine * unit_x + cosine * unit_y
+    edge_offset = 1 / math.sqrt(
+        (local_x / semi_axis_x) ** 2 + (local_y / semi_axis_y) ** 2
+    )
+    return center_distance + edge_offset
+
+
+def update_eye_sphere_radius(eye_center, current_pupil_ellipse, current_pupil_confidence):
+    """Grow/adapt IR overlay sphere radius from confident pupil ellipses (never shrink)."""
+    global max_observed_distance, last_sphere_radius_ellipse
+
+    if last_sphere_radius_ellipse is not None:
+        anchored_distance = distance_to_pupil_outer_edge(
+            eye_center,
+            last_sphere_radius_ellipse,
+        )
+        if anchored_distance is not None:
+            max_observed_distance = anchored_distance
+
+    if (
+        current_pupil_ellipse is not None
+        and current_pupil_confidence >= PUPIL_CONFIDENCE_THRESHOLD_SPHERE
+        and len(model_centers) >= MIN_MODEL_CENTERS
+    ):
+        current_distance = distance_to_pupil_outer_edge(
+            eye_center,
+            current_pupil_ellipse,
+        )
+        if current_distance is not None and (
+            last_sphere_radius_ellipse is None
+            or current_distance > max_observed_distance
+        ):
+            max_observed_distance = current_distance
+            last_sphere_radius_ellipse = current_pupil_ellipse
+
+
+def eye_sphere_display_radius():
+    """Radius for the red eye-sphere circle on IR preview."""
+    if max_observed_distance and max_observed_distance > 0:
+        return int(max_observed_distance)
+    return EYE_SPHERE_RADIUS_PX
+
+
 #Fits an ellipse to the optimized contours and draws it on the image.
 def fit_and_draw_ellipses(image, optimized_contours, color):
     if len(optimized_contours) >= 5:
@@ -536,6 +646,7 @@ def _show_tracking_windows(frame, gl_image=None, status_text=None):
         cv2.putText(frame, status_text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
         cv2.putText(frame, status_text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+    # Written directly to the dict (current_eye_id set by load_eye_tracking_state).
     eye_tracking_states[current_eye_id]["preview_frame"] = frame.copy()
 
     if not show_separate_tracking_windows:
@@ -548,12 +659,18 @@ def _show_tracking_windows(frame, gl_image=None, status_text=None):
         cv2.imshow(eye_window_name("Tracker + Sphere"), blended)
 
 
-# Process frames for pupil detection
 def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window):
+    """Process frames for pupil detection.
+    Each frame is processed through a series of thresholding and contour detection steps to find the best pupil candidate.
+    The best pupil candidate is then used to estimate the pupil's position and size.
+    The pupil's position and size are then used to estimate the pupil's gaze direction.
+    The gaze direction is then used to estimate the pupil's gaze direction.
+    """
     global ray_lines
     global max_rays
     global prev_model_center_avg
-    global max_observed_distance
+    global sphere_center_locked_2d, locked_model_center_avg
+    global max_observed_distance, last_sphere_radius_ellipse
 
     kernel_size = 5
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
@@ -566,11 +683,11 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
 
     image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
     name_array = ["relaxed", "medium", "strict"] #for naming windows
-    final_image = image_array[0] #holds return array
+    # final_image = image_array[0] #holds return array
     final_contours = [] #holds final contours
-    ellipse_reduced_contours = [] #holds an array of the best contour points from the fitting process
+    # ellipse_reduced_contours = [] #holds an array of the best contour points from the fitting process
     goodness = 0 #goodness value for best ellipse
-    best_array = 0 
+    # best_array = 0 
     kernel_size = 5  # Size of the kernel (5x5)
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
     gray_copy1 = gray_frame.copy()
@@ -578,6 +695,8 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     gray_copy3 = gray_frame.copy()
     gray_copies = [gray_copy1, gray_copy2, gray_copy3]
     final_goodness = 0
+    best_ratio_under_ellipse = 0
+    best_center_x, best_center_y = None, None
     
     #iterate through binary images and see which fits the ellipse best
     for i in range(1,4):
@@ -611,11 +730,17 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
 
         if final_goodness > 0 and final_goodness > goodness: 
             goodness = final_goodness
+            best_ratio_under_ellipse = total_pixels[1]
             ellipse_reduced_contours = total_pixels[2]
             best_image = image_array[i-1]
             final_contours = reduced_contours
             final_image = dilated_image
+            best_center_x = center_x
+            best_center_y = center_y
 
+    center_x = best_center_x
+    center_y = best_center_y
+    
     test_frame = frame.copy()
     
     final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
@@ -626,18 +751,23 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         ellipse = cv2.fitEllipse(final_contours[0])
         final_rotated_rect = ellipse
 
-        # Store the new ray in the list
-        ray_lines.append(final_rotated_rect)
-        # **Prune rays if list exceeds max_rays**
-        if len(ray_lines) > max_rays:
-            num_to_remove = len(ray_lines) - max_rays
-            ray_lines = ray_lines[num_to_remove:]  # Keep only the last `max_rays` elements
+        # Store pupil ray only when confident (3DTracker mono gate)
+        if (
+            EYE_SPHERE_ADJUSTMENT_ENABLED
+            and not sphere_center_locked_2d
+            and best_ratio_under_ellipse >= PUPIL_CONFIDENCE_THRESHOLD
+        ):
+            ray_lines.append(final_rotated_rect)
+            if len(ray_lines) > max_rays:
+                num_to_remove = len(ray_lines) - max_rays
+                ray_lines = ray_lines[num_to_remove:]
 
-    global sphere_center_locked_2d, locked_model_center_avg, prev_model_center_avg
+    model_center_average = (320, 240)
 
-    model_center_average = (320,240)
-
-    model_center = compute_average_intersection(frame, ray_lines, 5, 1500, 5)
+    if EYE_SPHERE_ADJUSTMENT_ENABLED and not sphere_center_locked_2d:
+        model_center = compute_average_intersection(frame, ray_lines, 5, 1500, 5)
+    else:
+        model_center = None
 
     if not sphere_center_locked_2d:
         # Normal behavior: keep updating running average while unlocked
@@ -654,27 +784,26 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         # Once locked, always use the frozen center
         model_center_average = locked_model_center_avg
 
-    
+    sphere_radius = eye_sphere_display_radius()
+
     # Example safety check — still refresh the window so it does not look frozen.
     if center_x is None or center_y is None or model_center_average[0] is None or model_center_average[1] is None:
-        sphere_radius = int(max_observed_distance) if max_observed_distance else 202
         if model_center_average[0] is not None:
             cv2.circle(frame, model_center_average, sphere_radius, (255, 50, 50), 2)
             cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)
         _show_tracking_windows(frame, status_text="No pupil detected")
         return final_rotated_rect
 
-    # Calculate the distance only if model_centers has at least 100 values
-    if len(model_centers) >= 100 and center_x is not None:
-        distance = math.sqrt((center_x - model_center_average[0]) ** 2 + (center_y - model_center_average[1]) ** 2)
-        if distance > max_observed_distance:
-            max_observed_distance = distance
-            
-    max_observed_distance = 202
+    if final_rotated_rect is not None:
+        update_eye_sphere_radius(
+            model_center_average,
+            final_rotated_rect,
+            best_ratio_under_ellipse,
+        )
+        sphere_radius = eye_sphere_display_radius()
 
-    # Draw reference lines/ellipses
-    cv2.circle(frame, model_center_average, int(max_observed_distance), (255, 50, 50), 2)  # Draw eye sphere (circle)
-    cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)  # Draw eye center
+    cv2.circle(frame, model_center_average, sphere_radius, (255, 50, 50), 2)
+    cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)
 
 
 
@@ -727,9 +856,6 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         # Draw text on the frame
         cv2.putText(frame, origin_text, text_origin2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         cv2.putText(frame, dir_text, text_dir2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-    if center is not None and direction is not None:
-        update_eye_gaze_output(current_eye_id, center, direction)
 
     _show_tracking_windows(frame, gl_image=gl_image)
 
@@ -905,41 +1031,6 @@ def rotation_from_a_to_b(a, b):
         + K * sine
         + (K @ K) * (1.0 - cosine)
     ).astype(np.float32)
-
-def update_gaze_circle_from_current_gaze():
-    """
-    Use the latest gaze vector to update the circle position on the external camera.
-    Assumes we have calibrated R_gaze_to_cam that maps gaze_dir to external cam space.
-    """
-    global circle_x, circle_y, last_gaze_dir, calibrated
-    global _smoothed_circle_u, _smoothed_circle_v
-
-    if not calibrated:
-        return
-
-    gaze_dir = get_combined_gaze_dir()
-    if gaze_dir is None:
-        return
-
-    g = R_gaze_to_cam @ gaze_dir
-
-    # Avoid weird cases where gaze points behind the camera
-    if g[2] <= 1e-6:
-        return
-
-    # Simple pinhole projection onto 2D
-    u = float(np.clip(EXT_CX + EXT_FX * (g[0] / g[2]), 0, EXT_WIDTH - 1))
-    v = float(np.clip(EXT_CY - EXT_FY * (g[1] / g[2]), 0, EXT_HEIGHT - 1))
-
-    if _smoothed_circle_u is None:
-        _smoothed_circle_u, _smoothed_circle_v = u, v
-    else:
-        alpha = GAZE_CIRCLE_SMOOTH_ALPHA
-        _smoothed_circle_u = (1.0 - alpha) * _smoothed_circle_u + alpha * u
-        _smoothed_circle_v = (1.0 - alpha) * _smoothed_circle_v + alpha * v
-
-    circle_x = int(round(_smoothed_circle_u))
-    circle_y = int(round(_smoothed_circle_v))
 
 def find_line_intersection(ellipse1, ellipse2):
     """
@@ -1191,7 +1282,6 @@ def calibrate_gaze_to_external(active_eyes=EYE_IDS):
 
     calibrated = True
     refresh_combined_gaze(active_eyes)
-    write_gaze_vector_file()
     print("Calibration complete (combined gaze aligned to front camera forward).")
 
 
@@ -1199,6 +1289,7 @@ def calibrate_gaze_to_external(active_eyes=EYE_IDS):
 
 
 def process_frame(frame, eye_id="left", flip_vertical=False, flip_horizontal=False):
+    """Process one IR frame. load/save bracket keeps left and right state separate."""
     if flip_vertical:
         frame = cv2.flip(frame, 0)
     if flip_horizontal:
