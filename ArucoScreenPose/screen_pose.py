@@ -47,10 +47,10 @@ MAX_REPROJ_ERROR_PX = 12.0  # reject pose if mean reprojection exceeds this
 MIN_MARKERS_FOR_POSE = 3  # minimum corner IDs (0-3) to run PnP
 
 # On-screen corner markers for GazeScreen3D / ArucoScreenPose:
-# ~12.5% of shorter screen edge (min 80px, max 160px).
-MARKER_SIZE_DIVISOR = 8
-MARKER_SIZE_MIN = 80
-MARKER_SIZE_MAX = 160
+# ~14% of shorter screen edge (min 90px, max 176px).
+MARKER_SIZE_DIVISOR = 7
+MARKER_SIZE_MIN = 90
+MARKER_SIZE_MAX = 176
 
 
 def detect_cameras(max_cams=6):

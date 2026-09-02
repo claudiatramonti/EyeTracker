@@ -239,3 +239,66 @@ def draw_edge_targets(canvas, width_px, height_px, done_edges, margin=MARGIN_PX)
             2,
             cv2.LINE_AA,
         )
+
+
+def draw_center_calib_target(canvas, width_px, height_px, margin=MARGIN_PX):
+    """
+    Large marker at the physical monitor center — look HERE for C calibration.
+
+    Not the front-camera PiP: C aligns gaze to camera forward while you look at
+    the real screen center (same point used by ArUco mm frame origin).
+    """
+    targets = calibration_targets(width_px, height_px, margin=margin)
+    cx = int(round(targets["center"][0]))
+    cy = int(round(targets["center"][1]))
+    color = (0, 255, 255)  # cyan BGR
+
+    cv2.circle(canvas, (cx, cy), 56, color, 2, cv2.LINE_AA)
+    cv2.drawMarker(canvas, (cx, cy), color, cv2.MARKER_CROSS, 72, 3, cv2.LINE_AA)
+    cv2.circle(canvas, (cx, cy), 6, (255, 255, 255), -1, cv2.LINE_AA)
+
+    label = "GUARDA QUI  -  premi C"
+    sub = "(centro MONITOR, non la preview Front)"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(label, font, 0.85, 2)
+    tx = int(np.clip(cx - tw // 2, 8, max(8, width_px - tw - 8)))
+    ty = cy - 72
+    cv2.putText(canvas, label, (tx + 2, ty + 2), font, 0.85, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(canvas, label, (tx, ty), font, 0.85, color, 2, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        sub,
+        (tx, ty + 28),
+        font,
+        0.55,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def draw_front_preview_not_for_c(canvas, x, y, w, h):
+    """Reminder on the front PiP — C uses physical screen center, not this window."""
+    if w < 40 or h < 30:
+        return
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 140, 255), 2)
+    cv2.putText(
+        canvas,
+        "Front = debug",
+        (x + 6, y + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 140, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "NON usare per C",
+        (x + 6, y + h - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 140, 255),
+        1,
+        cv2.LINE_AA,
+    )

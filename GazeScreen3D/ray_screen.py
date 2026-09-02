@@ -52,9 +52,15 @@ def gaze_dir_in_cam(gaze_dir_eye, R_gaze_to_cam, opencv_y_down=True, scale_x=1.0
     Map eye gaze to front-camera direction.
 
     eye_tracker uses Y-up gaze space; R from C is ~identity when looking forward.
+
     Pinhole preview uses ``cy - fy * g[1]`` (projection space, Y-up).
+
     3D ray ∩ plane needs OpenCV camera coords (Y down) → flip g[1] when requested.
-    Optional scale_x/scale_y refine yaw/pitch in OpenCV (Y-down) space after R.
+
+    scale_x / scale_y (default 1 = do nothing):
+        Optional fine-tuning after center calib (C). Arrow keys at screen edges
+        set these so left/right and up/down gaze reach the borders more accurately.
+        They only stretch the gaze direction a bit; ArUco screen hit is unchanged.
     """
     if gaze_dir_eye is None or R_gaze_to_cam is None:
         return None

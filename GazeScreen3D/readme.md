@@ -44,7 +44,8 @@ Select left IR (optional right), and front camera.
 0. *(Optional)* Chessboard calib tool lives in `ArucoScreenPose/calibrate_front_camera.py`.
    Loading of `front_camera.npz` is **off by default** for now (HFOV 60° + `-`/`+`).
 1. Point the front camera at this window until HUD shows ArUco pose OK (3+/4 corners).
-2. Look at the **center of the monitor** and press **C**.
+2. Look at the **cyan cross** at the **center of the monitor** (full window) and press **C**.  
+   Do **not** look at the small **Front** preview — that is only for debugging ArUco.
 3. *(Optional)* Look at top / bottom / left / right edges and press the matching arrow.
    Yellow crosses = pending, green = sampled. Scales help edge accuracy; ArUco still
    handles head motion.

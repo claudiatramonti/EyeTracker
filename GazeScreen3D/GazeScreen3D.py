@@ -29,7 +29,12 @@ for path in (ROOT, os.path.join(REPO, "ArucoScreenPose")):
         sys.path.insert(0, path)
 
 from camera_io import CameraReader
-from gaze_scale_calib import GazeScaleCalib, draw_edge_targets
+from gaze_scale_calib import (
+    GazeScaleCalib,
+    draw_center_calib_target,
+    draw_edge_targets,
+    draw_front_preview_not_for_c,
+)
 from heatmap import GazeHeatmap
 from ray_screen import gaze_to_screen, project_gaze_to_front_pixels
 
@@ -368,7 +373,7 @@ def run(choice):
     print("GazeScreen3D ready.")
     print("1) Point front camera at this window until Pose OK")
     print("2) Click IR preview to lock eye center if the yellow circle drifts")
-    print("3) Look at SCREEN CENTER and press C")
+    print("3) Look at the CYAN CROSS at MONITOR CENTER (not the Front preview) and press C")
     print("4) Optional: look at each edge and press arrow keys (refine yaw/pitch scale)")
     print("5) Gaze heatmap follows ray ∩ ArUco plane")
     print("Q quit | C center | arrows edges | E reset edges | U unlock | M V K -/+ FOV")
@@ -455,6 +460,8 @@ def run(choice):
             tracker.markers.paste_on(canvas)
             if eye_tracker.calibrated:
                 draw_edge_targets(canvas, screen_w, screen_h, scale_calib.edges_done)
+            else:
+                draw_center_calib_target(canvas, screen_w, screen_h)
 
             x1, y1, x2, y2 = tracker.markers.preview_rect()
             if show_previews and front_display is not None:
@@ -462,6 +469,8 @@ def run(choice):
                 preview, _, _, _, _ = fit_frame(front_display, pw, ph)
                 canvas[y1 : y1 + ph, x1 : x1 + pw] = preview
                 cv2.rectangle(canvas, (x1, y1), (x1 + pw, y1 + ph), (180, 180, 180), 1)
+                if not eye_tracker.calibrated:
+                    draw_front_preview_not_for_c(canvas, x1, y1, pw, ph)
                 cv2.putText(
                     canvas,
                     "Front",
@@ -518,7 +527,7 @@ def run(choice):
                 lines.append("Gaze to cam: calibrated (C)")
                 lines.append(scale_calib.status_line())
             else:
-                lines.append("Gaze to cam: press C while looking at SCREEN CENTER")
+                lines.append("Gaze to cam: guarda croce CIANO al centro MONITOR, premi C")
             lines.append(
                 "Eye center: LOCKED (U unlock)" if locked_any else "Eye center: auto (click IR preview to lock)"
             )
