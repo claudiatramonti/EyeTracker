@@ -266,7 +266,7 @@ def draw_center_calib_target(canvas, width_px, height_px, margin=MARGIN_PX):
     cv2.putText(canvas, label, (tx, ty), font, 0.85, color, 2, cv2.LINE_AA)
     cv2.putText(
         canvas,
-        sub,
+        "centro MONITOR",
         (tx, ty + 28),
         font,
         0.55,

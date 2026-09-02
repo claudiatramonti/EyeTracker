@@ -137,7 +137,6 @@ def get_screen_mm(window_width, window_height):
     scale_y = window_height / max(monitor_h_px, 1)
     return width_mm * scale_x, height_mm * scale_y
 
-
 def camera_matrix(width, height, hfov_deg):
     """K from assumed HFOV (fallback when no chessboard calib file)."""
     from camera_intrinsics import camera_matrix_from_hfov
@@ -407,6 +406,14 @@ class CornerMarkers:
             self.screen_height - margin - size - pad,
         )
 
+    def draw_center(self, frame):
+        """Screen-center guide for calibration (object-frame origin)."""
+        cx = self.screen_width // 2
+        cy = self.screen_height // 2
+        short = min(self.screen_width, self.screen_height)
+        scale = short / 1080.0
+        draw_center_marker(frame, cx, cy, color=(0, 255, 255), scale=scale)
+
     def paste_on(self, frame):
         if not self.visible:
             return frame
@@ -605,7 +612,7 @@ class ScreenPoseTracker:
                 dist,
             )
             ox, oy = origin_2d.reshape(2).astype(int)
-            cv2.circle(frame, (ox, oy), 5, (255, 0, 255), -1)
+            draw_center_marker(frame, ox, oy, color=(255, 0, 255), scale=0.55)
 
     def _draw_status(self, frame):
         lines = []
@@ -649,6 +656,19 @@ class ScreenPoseTracker:
         if self.corner_ids_found:
             return f"ArUco {len(self.corner_ids_found)}/4"
         return "ArUco: waiting..."
+
+
+def draw_center_marker(frame, x, y, color=(0, 255, 255), scale=1.0):
+    """High-contrast crosshair + ring for the screen / pose origin."""
+    ix, iy = int(x), int(y)
+    cross = max(20, int(44 * scale))
+    ring = max(14, int(30 * scale))
+    outline = max(2, int(3 * scale))
+    cv2.drawMarker(frame, (ix, iy), (0, 0, 0), cv2.MARKER_CROSS, cross + 8, outline + 1, cv2.LINE_AA)
+    cv2.circle(frame, (ix, iy), ring + 3, (0, 0, 0), outline + 1, cv2.LINE_AA)
+    cv2.drawMarker(frame, (ix, iy), color, cv2.MARKER_CROSS, cross, max(2, outline - 1), cv2.LINE_AA)
+    cv2.circle(frame, (ix, iy), ring, color, max(2, outline - 1), cv2.LINE_AA)
+    cv2.circle(frame, (ix, iy), max(3, int(5 * scale)), color, -1, cv2.LINE_AA)
 
 
 def fit_frame(frame, width, height):
