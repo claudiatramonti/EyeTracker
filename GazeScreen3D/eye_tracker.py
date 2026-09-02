@@ -5,10 +5,16 @@ import random
 import math
 import numpy as np
 import os
+import sys
 import time
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 GAZE_VECTOR_PATH = os.path.join(MODULE_DIR, "gaze_vector.txt")
+
+# gl_sphere.py lives in 3DTracker (folder name is not a valid package, so path insert).
+_GL_SPHERE_DIR = os.path.normpath(os.path.join(MODULE_DIR, "..", "3DTracker"))
+if _GL_SPHERE_DIR not in sys.path:
+    sys.path.insert(0, _GL_SPHERE_DIR)
 
 try:
     import gl_sphere
@@ -39,12 +45,18 @@ combined_gaze_dir = None
 calibrated = False
 R_gaze_to_cam = np.eye(3, dtype=np.float32)
 
+# External camera viewport width and height
 EXT_WIDTH = 640
 EXT_HEIGHT = 480
+
+# External camera viewport center
 EXT_CX = EXT_WIDTH // 2
 EXT_CY = EXT_HEIGHT // 2
+
+# External camera viewport focal length 
 EXT_FX = 600.0
 EXT_FY = 600.0
+
 # IR module virtual camera FOV (GC0308 ~80°); used in compute_gaze_vector pupil→3D ray
 IR_FOV_Y_DEG = 80.0
 circle_x = EXT_CX
