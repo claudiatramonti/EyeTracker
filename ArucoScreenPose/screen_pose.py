@@ -44,7 +44,7 @@ CORNER_MARKER_IDS = {
 DEFAULT_HFOV_DEG = 60.0  # assumed front-camera HFOV (keys - / + / 0)
 POSE_SMOOTH_ALPHA = 0.35  # exponential blend of R, t across frames
 MAX_REPROJ_ERROR_PX = 12.0  # reject pose if mean reprojection exceeds this
-MIN_MARKERS_FOR_POSE = 3  # minimum corner IDs (0-3) to run PnP
+MIN_MARKERS_FOR_POSE = 4  # all corner IDs 0-3 required for stable PnP
 
 # On-screen corner markers for GazeScreen3D / ArucoScreenPose:
 # ~14% of shorter screen edge (min 90px, max 176px).
@@ -629,8 +629,10 @@ class ScreenPoseTracker:
             lines.append(f"cam mm  X {p[0]:+.0f}  Y {p[1]:+.0f}  dist {a['distance_mm']:.0f}")
             color = (0, 255, 0)
         elif self.corner_ids_found:
+            missing = sorted(set(CORNER_MARKER_IDS) - self.corner_ids_found)
+            miss_txt = ",".join(str(m) for m in missing) if missing else "?"
             lines.append(
-                f"ArUco: {len(self.corner_ids_found)}/4 angles (at least {MIN_MARKERS_FOR_POSE})"
+                f"ArUco: {len(self.corner_ids_found)}/4 — need all corners (missing ID {miss_txt})"
             )
             color = (0, 255, 255)
         elif self.markers_found:
@@ -654,7 +656,10 @@ class ScreenPoseTracker:
                 f"roll {a['roll_deg']:+.1f}  dist {a['distance_mm']:.0f} mm"
             )
         if self.corner_ids_found:
-            return f"ArUco {len(self.corner_ids_found)}/4"
+            n = len(self.corner_ids_found)
+            if n < MIN_MARKERS_FOR_POSE:
+                return f"ArUco {n}/4 — need 4/4"
+            return f"ArUco {n}/4"
         return "ArUco: waiting..."
 
 

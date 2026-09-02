@@ -371,7 +371,7 @@ def run(choice):
 
     show_previews = True
     print("GazeScreen3D ready.")
-    print("1) Point front camera at this window until Pose OK")
+    print("1) Point front camera at this window until Pose OK (4/4 ArUco corners)")
     print("2) Click IR preview to lock eye center if the yellow circle drifts")
     print("3) Look at the CYAN CROSS at MONITOR CENTER (not the Front preview) and press C")
     print("4) Optional: look at each edge and press arrow keys (refine yaw/pitch scale)")
@@ -458,10 +458,6 @@ def run(choice):
             # --- Compose ---
             canvas = heatmap.render_bgr()
             tracker.markers.paste_on(canvas)
-            if eye_tracker.calibrated:
-                draw_edge_targets(canvas, screen_w, screen_h, scale_calib.edges_done)
-            else:
-                draw_center_calib_target(canvas, screen_w, screen_h)
 
             x1, y1, x2, y2 = tracker.markers.preview_rect()
             if show_previews and front_display is not None:
@@ -536,7 +532,10 @@ def run(choice):
                 state = "ON screen" if hit["on_screen"] else "OFF screen"
                 lines.append(f"Hit {state}  ({hit['u']:.0f}, {hit['v']:.0f}) px")
             elif not tracker.ready:
-                lines.append("Waiting for ArUco screen pose...")
+                if tracker.corner_ids_found and len(tracker.corner_ids_found) < sp.MIN_MARKERS_FOR_POSE:
+                    lines.append("Waiting for 4/4 ArUco corners...")
+                else:
+                    lines.append("Waiting for ArUco screen pose...")
             elif not eye_tracker.calibrated:
                 lines.append("Waiting for C calibration...")
             else:
@@ -544,6 +543,11 @@ def run(choice):
 
             lines.append("Q quit | C center | arrows edges | E reset edges | U M V K | -/+ FOV")
             draw_hud(canvas, [ln for ln in lines if ln], x=x1, y=36)
+
+            if eye_tracker.calibrated:
+                draw_edge_targets(canvas, screen_w, screen_h, scale_calib.edges_done)
+            else:
+                draw_center_calib_target(canvas, screen_w, screen_h)
 
             cv2.imshow(WINDOW_NAME, canvas)
 
