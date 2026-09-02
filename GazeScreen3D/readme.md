@@ -28,8 +28,10 @@ Select left IR (optional right), and front camera.
 | Key | Action |
 |-----|--------|
 | **C** | Calibrate: look at physical screen center |
-| **↑ ↓ ← →** | Optional edge samples (refine yaw/pitch scale after C) |
-| **E** | Reset edge scales (`sx=sy=1`), keep C |
+| **↑ ↓ ← →** | Edge samples (12 frames each; one scale per direction) |
+| **E** | Reset edge scales, keep C |
+| **[** / **]** | Fine-tune vertical narrower / wider |
+| **,** / **.** | Fine-tune horizontal narrower / wider |
 | **click IR** | Lock eyeball center on that eye preview |
 | **U** | Unlock eye centers (auto-track again) |
 | **M** | Toggle corner ArUco markers |
@@ -46,9 +48,8 @@ Select left IR (optional right), and front camera.
 1. Point the front camera at this window until HUD shows **Pose OK with 4/4** ArUco corners.
 2. Look at the **cyan cross** at the **center of the monitor** (full window) and press **C**.  
    Do **not** look at the small **Front** preview — that is only for debugging ArUco.
-3. *(Optional)* Look at top / bottom / left / right edges and press the matching arrow.
-   Yellow crosses = pending, green = sampled. Scales help edge accuracy; ArUco still
-   handles head motion.
+3. Calibrate **all 4 edges**: look at each cross, press **↑ ↓ ← →** (~12 frames each).
+   Fine-tune: **[** / **]** vertical, **,** / **.** horizontal.
 4. Look around; green crosshair = on screen, heatmap accumulates.
 
 IR eye model uses **80° vertical FOV** (`IR_FOV_Y_DEG` in `eye_tracker.py`, GC0308). Re-press **C** after changing it.

@@ -34,6 +34,7 @@ from gaze_scale_calib import (
     draw_center_calib_target,
     draw_edge_targets,
     draw_front_preview_not_for_c,
+    record_edge_from_gaze_samples,
 )
 from heatmap import GazeHeatmap
 from ray_screen import gaze_to_screen, project_gaze_to_front_pixels
@@ -43,6 +44,8 @@ import screen_pose as sp
 
 WINDOW_NAME = "GazeScreen3D"
 DEFAULT_HFOV = sp.DEFAULT_HFOV_DEG
+EDGE_CALIB_FRAMES = 12
+EDGE_NUDGE = 0.05
 
 # Synthetic arrow codes (outside ASCII), same idea as HeatMap input_poll.
 KEY_UP = 0xE001
@@ -65,6 +68,10 @@ _WIN32_KEY_VKS = (
     (0x30, ord("0")),
     (0xBB, ord("=")),
     (0xBD, ord("-")),
+    (0xDB, ord("[")),  # shrink vertical range
+    (0xDD, ord("]")),  # widen vertical range
+    (0xBC, ord(",")),  # shrink horizontal range
+    (0xBE, ord(".")),  # widen horizontal range
     (0x26, KEY_UP),
     (0x28, KEY_DOWN),
     (0x25, KEY_LEFT),
@@ -285,27 +292,24 @@ def draw_hud(canvas, lines, x=16, y=28):
     return y
 
 
-def calibrate_gaze(active_eyes, scale_calib=None):
-    """Look at screen center, then align combined gaze to front-camera forward."""
-    eye_tracker.calibrate_gaze_to_external(active_eyes)
-    ok = bool(eye_tracker.calibrated)
-    if ok:
-        if scale_calib is not None:
-            scale_calib.clear_edges()
-        print("C: gaze aligned to front camera. Optional: edges with arrow keys.")
-    return ok
+def _begin_edge_capture(edge):
+    return {"edge": edge, "samples": [], "need": EDGE_CALIB_FRAMES}
 
 
-def _record_edge_sample(scale_calib, edge, gaze, tracker, width_mm, height_mm, screen_w, screen_h):
-    if not eye_tracker.calibrated:
-        print("Press C at screen center before edge arrows.")
+def _append_edge_capture(pending, gaze_sample):
+    if not pending or not pending.get("edge") or gaze_sample is None:
+        return pending, False
+    pending["samples"].append(np.asarray(gaze_sample, dtype=np.float64).copy())
+    return pending, len(pending["samples"]) >= pending["need"]
+
+
+def _finish_edge_capture(pending, scale_calib, tracker, width_mm, height_mm, screen_w, screen_h):
+    if not pending or not pending.get("edge"):
         return
-    if not tracker.ready or tracker._rotation is None or tracker._translation is None:
-        print("Wait for ArUco pose before edge arrows.")
-        return
-    ok, message = scale_calib.record_edge(
-        edge,
-        gaze,
+    ok, message = record_edge_from_gaze_samples(
+        scale_calib,
+        pending["edge"],
+        pending["samples"],
         eye_tracker.R_gaze_to_cam,
         tracker._rotation,
         tracker._translation,
@@ -315,6 +319,17 @@ def _record_edge_sample(scale_calib, edge, gaze, tracker, width_mm, height_mm, s
         screen_h,
     )
     print(message if ok else f"Edge calib failed: {message}")
+
+
+def calibrate_gaze(active_eyes, scale_calib=None):
+    """Look at screen center, then align combined gaze to front-camera forward."""
+    eye_tracker.calibrate_gaze_to_external(active_eyes)
+    ok = bool(eye_tracker.calibrated)
+    if ok:
+        if scale_calib is not None:
+            scale_calib.clear_edges()
+        print("C: gaze aligned. Calibrate all 4 edges: look at cross, press matching arrow.")
+    return ok
 
 
 def run(choice):
@@ -370,13 +385,15 @@ def run(choice):
     cv2.setMouseCallback(WINDOW_NAME, make_mouse_handler(layout_state))
 
     show_previews = True
+    pending_edge = None
     print("GazeScreen3D ready.")
     print("1) Point front camera at this window until Pose OK (4/4 ArUco corners)")
     print("2) Click IR preview to lock eye center if the yellow circle drifts")
     print("3) Look at the CYAN CROSS at MONITOR CENTER (not the Front preview) and press C")
-    print("4) Optional: look at each edge and press arrow keys (refine yaw/pitch scale)")
-    print("5) Gaze heatmap follows ray ∩ ArUco plane")
-    print("Q quit | C center | arrows edges | E reset edges | U unlock | M V K -/+ FOV")
+    print("4) Calibrate edges: look at each cross, press ↑ ↓ ← → (~12 frames each)")
+    print("5) Fine-tune: [ ] vertical   , . horizontal")
+    print("6) Gaze heatmap follows ray ∩ ArUco plane")
+    print("Q quit | C | arrows | E reset | [ ] , . | U M V K -/+ FOV")
 
     try:
         while True:
@@ -398,6 +415,15 @@ def run(choice):
                 )
 
             gaze = eye_tracker.refresh_combined_gaze(active_eyes)
+            raw_gaze = eye_tracker.get_raw_combined_gaze_dir()
+
+            if pending_edge is not None and raw_gaze is not None:
+                pending_edge, ready = _append_edge_capture(pending_edge, raw_gaze)
+                if ready:
+                    _finish_edge_capture(
+                        pending_edge, scale_calib, tracker, width_mm, height_mm, screen_w, screen_h
+                    )
+                    pending_edge = None
 
             # --- Front + ArUco ---
             front_display = None
@@ -428,8 +454,10 @@ def run(choice):
                     height_mm,
                     screen_w,
                     screen_h,
-                    scale_x=scale_calib.scale_x,
-                    scale_y=scale_calib.scale_y,
+                    scale_x_left=scale_calib.scale_x_left,
+                    scale_x_right=scale_calib.scale_x_right,
+                    scale_y_up=scale_calib.scale_y_up,
+                    scale_y_down=scale_calib.scale_y_down,
                 )
                 if hit is not None:
                     heatmap.add_hit(hit["u"], hit["v"], hit["on_screen"])
@@ -443,8 +471,10 @@ def run(choice):
                             eye_tracker.EXT_FY,
                             eye_tracker.EXT_CX,
                             eye_tracker.EXT_CY,
-                            scale_x=scale_calib.scale_x,
-                            scale_y=scale_calib.scale_y,
+                            scale_x_left=scale_calib.scale_x_left,
+                            scale_x_right=scale_calib.scale_x_right,
+                            scale_y_up=scale_calib.scale_y_up,
+                            scale_y_down=scale_calib.scale_y_down,
                         )
                         if uv is not None:
                             cv2.circle(
@@ -528,7 +558,11 @@ def run(choice):
                 "Eye center: LOCKED (U unlock)" if locked_any else "Eye center: auto (click IR preview to lock)"
             )
 
-            if hit is not None:
+            if pending_edge is not None and pending_edge.get("edge"):
+                n = len(pending_edge.get("samples", []))
+                need = pending_edge.get("need", EDGE_CALIB_FRAMES)
+                lines.append(f"Edge calib {pending_edge['edge']}: {n}/{need} frames...")
+            elif hit is not None:
                 state = "ON screen" if hit["on_screen"] else "OFF screen"
                 lines.append(f"Hit {state}  ({hit['u']:.0f}, {hit['v']:.0f}) px")
             elif not tracker.ready:
@@ -541,7 +575,7 @@ def run(choice):
             else:
                 lines.append("No gaze / no intersection")
 
-            lines.append("Q quit | C center | arrows edges | E reset edges | U M V K | -/+ FOV")
+            lines.append("Q quit | C | arrows | E | [ ] , . | U M V K | -/+ FOV")
             draw_hud(canvas, [ln for ln in lines if ln], x=x1, y=36)
 
             if eye_tracker.calibrated:
@@ -558,7 +592,20 @@ def run(choice):
                 calibrate_gaze(active_eyes, scale_calib)
             elif key == ord("e"):
                 scale_calib.clear_edges()
-                print("Edge scales reset (sx=sy=1). C kept.")
+                pending_edge = None
+                print("Edge scales reset. C kept.")
+            elif key == ord("["):
+                scale_calib.nudge_vertical(-EDGE_NUDGE)
+                print(f"Vertical -  {scale_calib.scales_summary()}")
+            elif key == ord("]"):
+                scale_calib.nudge_vertical(EDGE_NUDGE)
+                print(f"Vertical +  {scale_calib.scales_summary()}")
+            elif key == ord(","):
+                scale_calib.nudge_horizontal(-EDGE_NUDGE)
+                print(f"Horizontal -  {scale_calib.scales_summary()}")
+            elif key == ord("."):
+                scale_calib.nudge_horizontal(EDGE_NUDGE)
+                print(f"Horizontal +  {scale_calib.scales_summary()}")
             elif key == ord("u"):
                 unlock_eye_sphere_centers(active_eyes)
             elif key == ord("m"):
@@ -580,22 +627,22 @@ def run(choice):
                 print(f"HFOV reset {tracker.hfov_deg:.0f}")
             elif key == ord("h"):
                 print(
-                    "C = center | arrows = edges (optional scale) | E = reset edges | "
+                    "C = center | arrows = 4 edges | E reset | [ ] vertical , . horizontal | "
                     "click IR = lock eye center | U unlock"
                 )
             else:
                 edge = _arrow_to_edge(key)
                 if edge is not None:
-                    _record_edge_sample(
-                        scale_calib,
-                        edge,
-                        gaze,
-                        tracker,
-                        width_mm,
-                        height_mm,
-                        screen_w,
-                        screen_h,
-                    )
+                    if not eye_tracker.calibrated:
+                        print("Press C at screen center before edge arrows.")
+                    elif not tracker.ready or tracker._rotation is None:
+                        print("Wait for ArUco pose before edge arrows.")
+                    else:
+                        pending_edge = _begin_edge_capture(edge)
+                        print(
+                            f"Capturing {edge} ({EDGE_CALIB_FRAMES} frames) — "
+                            f"keep looking at the {edge} cross..."
+                        )
     finally:
         for reader in readers.values():
             reader.stop()

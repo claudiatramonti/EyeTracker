@@ -87,25 +87,57 @@ def yaw_pitch_to_direction(yaw, pitch):
     return normalize(np.array([x, y, z], dtype=np.float64))
 
 
-def apply_yaw_pitch_scale(direction, scale_x=1.0, scale_y=1.0):
+def apply_yaw_pitch_scale(
+    direction,
+    scale_x=1.0,
+    scale_y=1.0,
+    scale_x_left=None,
+    scale_x_right=None,
+    scale_y_up=None,
+    scale_y_down=None,
+):
     """Stretch yaw/pitch of a cam-space unit direction. Identity if scales ~1."""
     if direction is None:
         return None
-    sx = float(scale_x)
-    sy = float(scale_y)
-    if abs(sx - 1.0) < 1e-6 and abs(sy - 1.0) < 1e-6:
+    sx_left = float(scale_x if scale_x_left is None else scale_x_left)
+    sx_right = float(scale_x if scale_x_right is None else scale_x_right)
+    sy_up = float(scale_y if scale_y_up is None else scale_y_up)
+    sy_down = float(scale_y if scale_y_down is None else scale_y_down)
+    if (
+        abs(sx_left - 1.0) < 1e-6
+        and abs(sx_right - 1.0) < 1e-6
+        and abs(sy_up - 1.0) < 1e-6
+        and abs(sy_down - 1.0) < 1e-6
+    ):
         return normalize(direction)
     angles = direction_to_yaw_pitch(direction)
     if angles is None:
         return normalize(direction)
     yaw, pitch = angles
-    return yaw_pitch_to_direction(yaw * sx, pitch * sy)
+    if yaw < 0.0:
+        yaw *= sx_left
+    elif yaw > 0.0:
+        yaw *= sx_right
+    if pitch < 0.0:
+        pitch *= sy_up
+    elif pitch > 0.0:
+        pitch *= sy_down
+    return yaw_pitch_to_direction(yaw, pitch)
 
 
 def _clip_scale(value):
     if value is None or not np.isfinite(value):
         return None
     return float(np.clip(value, SCALE_MIN, SCALE_MAX))
+
+
+def _angle_scale_ratio(measured, expected):
+    """|expected/measured| when signs agree; None if unusable."""
+    if abs(measured) < MIN_ANGLE_ABS or abs(expected) < MIN_ANGLE_ABS:
+        return None
+    if measured * expected < 0.0:
+        return None
+    return _clip_scale(abs(expected) / abs(measured))
 
 
 class GazeScaleCalib:
@@ -116,49 +148,92 @@ class GazeScaleCalib:
 
     def reset(self):
         self.samples = {}  # edge -> {yaw_m, pitch_m, yaw_e, pitch_e, u, v}
-        self.scale_x = 1.0
-        self.scale_y = 1.0
+        self.scale_x_left = 1.0
+        self.scale_x_right = 1.0
+        self.scale_y_up = 1.0
+        self.scale_y_down = 1.0
 
     def clear_edges(self):
         """Keep identity scales; drop edge samples (call after new C)."""
         self.samples.clear()
-        self.scale_x = 1.0
-        self.scale_y = 1.0
+        self.scale_x_left = 1.0
+        self.scale_x_right = 1.0
+        self.scale_y_up = 1.0
+        self.scale_y_down = 1.0
+
+    @property
+    def scale_x(self):
+        """Legacy single horizontal scale (mean of left/right)."""
+        return 0.5 * (self.scale_x_left + self.scale_x_right)
+
+    @property
+    def scale_y(self):
+        """Legacy single vertical scale (mean of up/down)."""
+        return 0.5 * (self.scale_y_up + self.scale_y_down)
+
+    def _clip_edge_scale(self, value):
+        return float(np.clip(value, SCALE_MIN, SCALE_MAX))
+
+    def nudge_horizontal(self, delta):
+        """Live fine-tune horizontal range (,/. keys)."""
+        self.scale_x_left = self._clip_edge_scale(self.scale_x_left + delta)
+        self.scale_x_right = self._clip_edge_scale(self.scale_x_right + delta)
+
+    def nudge_vertical(self, delta):
+        """Live fine-tune vertical range ([/] keys)."""
+        self.scale_y_up = self._clip_edge_scale(self.scale_y_up + delta)
+        self.scale_y_down = self._clip_edge_scale(self.scale_y_down + delta)
 
     @property
     def edges_done(self):
         return set(self.samples.keys())
 
+    def scales_summary(self):
+        return (
+            f"sx←={self.scale_x_left:.2f} sx→={self.scale_x_right:.2f}  "
+            f"sy↑={self.scale_y_up:.2f} sy↓={self.scale_y_down:.2f}"
+        )
+
     def status_line(self):
         done = "".join(EDGE_SHORT[e] for e in EDGE_ORDER if e in self.samples)
         pending = "".join(EDGE_SHORT[e] for e in EDGE_ORDER if e not in self.samples)
+        scales = self.scales_summary()
         if len(self.samples) == 0:
-            return "Edges: frecce SU/GIU/SIN/DES after C (optional)"
+            return f"Edges: ↑↓←→ after C (12 frames each)  [{scales}]"
         if len(self.samples) >= 4:
-            return f"Edges: OK {done}  sx={self.scale_x:.2f} sy={self.scale_y:.2f}"
-        return (
-            f"Edges: {done or '-'} need {pending}  "
-            f"sx={self.scale_x:.2f} sy={self.scale_y:.2f}"
-        )
+            return f"Edges: OK {done}  {scales}"
+        return f"Edges: {done or '-'} need {pending}  {scales}"
 
     def refit(self):
-        x_ratios = []
-        y_ratios = []
+        left_ratios = []
+        right_ratios = []
+        up_ratios = []
+        down_ratios = []
         for edge, sample in self.samples.items():
-            if edge in ("left", "right"):
-                ym, ye = sample["yaw_m"], sample["yaw_e"]
-                if abs(ym) >= MIN_ANGLE_ABS and abs(ye) >= MIN_ANGLE_ABS:
-                    ratio = _clip_scale(ye / ym)
-                    if ratio is not None:
-                        x_ratios.append(ratio)
-            elif edge in ("top", "bottom"):
-                pm, pe = sample["pitch_m"], sample["pitch_e"]
-                if abs(pm) >= MIN_ANGLE_ABS and abs(pe) >= MIN_ANGLE_ABS:
-                    ratio = _clip_scale(pe / pm)
-                    if ratio is not None:
-                        y_ratios.append(ratio)
-        self.scale_x = float(np.mean(x_ratios)) if x_ratios else 1.0
-        self.scale_y = float(np.mean(y_ratios)) if y_ratios else 1.0
+            if edge == "left":
+                ratio = _angle_scale_ratio(sample["yaw_m"], sample["yaw_e"])
+                if ratio is not None:
+                    left_ratios.append(ratio)
+            elif edge == "right":
+                ratio = _angle_scale_ratio(sample["yaw_m"], sample["yaw_e"])
+                if ratio is not None:
+                    right_ratios.append(ratio)
+            elif edge == "top":
+                ratio = _angle_scale_ratio(sample["pitch_m"], sample["pitch_e"])
+                if ratio is not None:
+                    up_ratios.append(ratio)
+            elif edge == "bottom":
+                ratio = _angle_scale_ratio(sample["pitch_m"], sample["pitch_e"])
+                if ratio is not None:
+                    down_ratios.append(ratio)
+        if left_ratios:
+            self.scale_x_left = float(np.mean(left_ratios))
+        if right_ratios:
+            self.scale_x_right = float(np.mean(right_ratios))
+        if up_ratios:
+            self.scale_y_up = float(np.mean(up_ratios))
+        if down_ratios:
+            self.scale_y_down = float(np.mean(down_ratios))
 
     def record_edge(
         self,
@@ -214,10 +289,47 @@ class GazeScaleCalib:
         self.refit()
         return (
             True,
-            f"{edge} OK ({EDGE_LABELS[edge]})  "
-            f"sx={self.scale_x:.2f} sy={self.scale_y:.2f}  "
+            f"{edge} OK ({EDGE_LABELS[edge]})  {self.scales_summary()}  "
             f"[{len(self.samples)}/4]",
         )
+
+
+def average_unit_vectors(vectors):
+    """Mean of unit 3D directions, re-normalized."""
+    valid = [np.asarray(v, dtype=np.float64).reshape(3) for v in vectors if v is not None]
+    if not valid:
+        return None
+    combined = np.sum(valid, axis=0)
+    return normalize(combined)
+
+
+def record_edge_from_gaze_samples(
+    scale_calib,
+    edge,
+    gaze_samples,
+    R_gaze_to_cam,
+    rotation,
+    translation,
+    width_mm,
+    height_mm,
+    width_px,
+    height_px,
+):
+    """Average several gaze frames, then run edge calibration once."""
+    gaze_dir = average_unit_vectors(gaze_samples)
+    if gaze_dir is None:
+        return False, f"{edge}: no gaze samples"
+    return scale_calib.record_edge(
+        edge,
+        gaze_dir,
+        R_gaze_to_cam,
+        rotation,
+        translation,
+        width_mm,
+        height_mm,
+        width_px,
+        height_px,
+    )
 
 
 def draw_edge_targets(canvas, width_px, height_px, done_edges, margin=MARGIN_PX):
@@ -228,13 +340,13 @@ def draw_edge_targets(canvas, width_px, height_px, done_edges, margin=MARGIN_PX)
         pt = (int(round(u)), int(round(v)))
         done = edge in done_edges
         color = (0, 220, 0) if done else (0, 220, 255)
-        cv2.drawMarker(canvas, pt, color, cv2.MARKER_CROSS, 28, 2)
+        cv2.drawMarker(canvas, pt, color, cv2.MARKER_CROSS, 36, 2)
         cv2.putText(
             canvas,
             EDGE_SHORT[edge],
-            (pt[0] + 10, pt[1] - 10),
+            (pt[0] + 12, pt[1] - 12),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.65,
             color,
             2,
             cv2.LINE_AA,
