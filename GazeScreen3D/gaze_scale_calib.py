@@ -257,8 +257,7 @@ def draw_center_calib_target(canvas, width_px, height_px, margin=MARGIN_PX):
     cv2.drawMarker(canvas, (cx, cy), color, cv2.MARKER_CROSS, 72, 3, cv2.LINE_AA)
     cv2.circle(canvas, (cx, cy), 6, (255, 255, 255), -1, cv2.LINE_AA)
 
-    label = "GUARDA QUI  -  premi C"
-    sub = "(centro MONITOR, non la preview Front)"
+    label = "GUARDA QUI  e  premi C"
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), _ = cv2.getTextSize(label, font, 0.85, 2)
     tx = int(np.clip(cx - tw // 2, 8, max(8, width_px - tw - 8)))
