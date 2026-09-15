@@ -134,6 +134,26 @@ def _arrow_to_edge(key):
     }.get(key)
 
 
+def _bgr_to_photoimage(tk, frame, max_w=420, max_h=315):
+    """Convert an OpenCV BGR frame to a tkinter PhotoImage (no Pillow)."""
+    fh, fw = frame.shape[:2]
+    scale = min(max_w / fw, max_h / fh)
+    nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    small = cv2.resize(frame, (nw, nh), interpolation=interp)
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    header = f"P6\n{nw} {nh}\n255\n".encode("ascii")
+    return tk.PhotoImage(data=header + rgb.tobytes(), format="PPM")
+
+
+def _placeholder_photo(tk, width, height, rgb=(34, 34, 34)):
+    """Solid-color PhotoImage used as a sized placeholder (avoids char-unit Label shrink)."""
+    r, g, b = rgb
+    row = bytes([r, g, b]) * width
+    header = f"P6\n{width} {height}\n255\n".encode("ascii")
+    return tk.PhotoImage(data=header + row * height, format="PPM")
+
+
 def selection_gui():
     import tkinter as tk
     from tkinter import ttk
@@ -141,11 +161,14 @@ def selection_gui():
     cameras = sp.detect_cameras()
     root = tk.Tk()
     root.title("GazeScreen3D")
+    # Room for 3× ~420px previews side by side.
+    root.minsize(980, 620)
+    root.geometry("1280x760")
     tk.Label(
         root,
         text="IR eye + front camera → gaze on screen (ArUco plane)",
         font=("Arial", 12, "bold"),
-    ).pack(pady=10)
+    ).pack(pady=8)
 
     def labels():
         return [str(c) for c in cameras] if cameras else ["0"]
@@ -161,7 +184,7 @@ def selection_gui():
     mirror_front = tk.BooleanVar(value=False)
 
     frame = ttk.Frame(root)
-    frame.pack(pady=6)
+    frame.pack(pady=4)
 
     def row(r, text, var, values):
         tk.Label(frame, text=text).grid(row=r, column=0, sticky="w", padx=6, pady=3)
@@ -171,6 +194,175 @@ def selection_gui():
     row(0, "Left IR:", left_var, labels())
     row(1, "Right IR:", right_var, ["None"] + labels())
     row(2, "Front camera:", front_var, labels())
+
+    # Live thumbnails so indices map to a real image before Start.
+    preview_wrap = ttk.LabelFrame(root, text="Camera previews (L / R / Front under each feed)")
+    preview_wrap.pack(padx=10, pady=8, fill="both", expand=True)
+    status_lbl = tk.Label(preview_wrap, text="Opening cameras…", font=("Arial", 9), fg="#555")
+    status_lbl.pack(pady=(4, 2))
+    thumbs = ttk.Frame(preview_wrap)
+    thumbs.pack(padx=6, pady=6, fill="both", expand=True)
+
+    preview_readers = {}
+    thumb_widgets = {}  # index -> {label, role_lbl, border, photo}
+
+    # Large enough to tell IR eye vs webcam apart at a glance.
+    PREVIEW_W, PREVIEW_H = 420, 315
+    ROLE_COLORS = {
+        "left": "#2e7d32",
+        "right": "#1565c0",
+        "front": "#e65100",
+        None: "#888888",
+    }
+
+    def role_for_index(idx):
+        roles = []
+        if left_var.get() == str(idx):
+            roles.append("Left IR")
+        if right_var.get() == str(idx):
+            roles.append("Right IR")
+        if front_var.get() == str(idx):
+            roles.append("Front")
+        return ", ".join(roles) if roles else "—"
+
+    def primary_role(idx):
+        if left_var.get() == str(idx):
+            return "left"
+        if right_var.get() == str(idx):
+            return "right"
+        if front_var.get() == str(idx):
+            return "front"
+        return None
+
+    def refresh_role_labels(*_args):
+        for idx, w in thumb_widgets.items():
+            w["role_lbl"].config(text=role_for_index(idx), fg=ROLE_COLORS[primary_role(idx)])
+            color = ROLE_COLORS[primary_role(idx)]
+            w["border"].config(highlightbackground=color, highlightcolor=color)
+
+    def _alt_cam(exclude, also_exclude=None):
+        skip = {str(exclude)}
+        if also_exclude is not None and also_exclude != "None":
+            skip.add(str(also_exclude))
+        for c in cameras:
+            if str(c) not in skip:
+                return str(c)
+        return None
+
+    def assign(idx, role):
+        s = str(idx)
+        if role != "left" and left_var.get() == s:
+            alt = _alt_cam(idx)
+            if alt is None:
+                return
+            left_var.set(alt)
+        if role != "right" and right_var.get() == s:
+            right_var.set("None")
+        if role != "front" and front_var.get() == s:
+            alt = _alt_cam(idx, left_var.get() if role == "left" else None)
+            if alt is None:
+                return
+            front_var.set(alt)
+        if role == "left":
+            left_var.set(s)
+        elif role == "right":
+            right_var.set(s)
+        else:
+            front_var.set(s)
+
+    def stop_previews():
+        if not preview_readers:
+            return
+        for reader in preview_readers.values():
+            reader.stop()
+        preview_readers.clear()
+        # Give Windows time to release exclusive USB handles before main open.
+        time.sleep(0.4)
+
+    def update_thumbs():
+        if not root.winfo_exists():
+            return
+        alive = 0
+        for idx, reader in list(preview_readers.items()):
+            ret, frame = reader.read()
+            w = thumb_widgets.get(idx)
+            if not w:
+                continue
+            if ret and frame is not None:
+                alive += 1
+                try:
+                    photo = _bgr_to_photoimage(tk, frame, PREVIEW_W, PREVIEW_H)
+                    w["label"].config(image=photo, text="")
+                    w["photo"] = photo  # keep ref
+                except tk.TclError:
+                    return
+            elif w["photo"] is None:
+                w["label"].config(text=f"Cam {idx}\n(no signal)")
+        if preview_readers:
+            status_lbl.config(
+                text=f"Live: {alive}/{len(preview_readers)} — use L / R / Front under each feed"
+            )
+        root.after(66, update_thumbs)
+
+    def build_thumbs():
+        placeholder = _placeholder_photo(tk, PREVIEW_W, PREVIEW_H)
+        for col, idx in enumerate(cameras):
+            cell = ttk.Frame(thumbs)
+            cell.grid(row=0, column=col, padx=10, pady=4, sticky="n")
+
+            border = tk.Frame(cell, highlightthickness=4, highlightbackground=ROLE_COLORS[None])
+            border.pack()
+            # Do NOT set width/height in characters: with an image those become pixels
+            # and crush the preview to a tiny strip (what happened before).
+            img_lbl = tk.Label(
+                border,
+                image=placeholder,
+                text=f"Cam {idx}\nopening…",
+                compound="center",
+                bg="#222",
+                fg="#ccc",
+                font=("Arial", 14, "bold"),
+            )
+            img_lbl.pack()
+
+            tk.Label(cell, text=f"Index {idx}", font=("Arial", 12, "bold")).pack(pady=(6, 0))
+            role_lbl = tk.Label(cell, text="—", font=("Arial", 11), fg=ROLE_COLORS[None])
+            role_lbl.pack()
+
+            btns = ttk.Frame(cell)
+            btns.pack(pady=6)
+            ttk.Button(btns, text="L", width=4, command=lambda i=idx: assign(i, "left")).pack(
+                side="left", padx=3
+            )
+            ttk.Button(btns, text="R", width=4, command=lambda i=idx: assign(i, "right")).pack(
+                side="left", padx=3
+            )
+            ttk.Button(btns, text="Front", width=7, command=lambda i=idx: assign(i, "front")).pack(
+                side="left", padx=3
+            )
+
+            thumb_widgets[idx] = {
+                "label": img_lbl,
+                "role_lbl": role_lbl,
+                "border": border,
+                "photo": placeholder,
+            }
+
+            reader = CameraReader(idx, width=640, height=480)
+            reader.start()
+            preview_readers[idx] = reader
+
+        if not cameras:
+            status_lbl.config(text="No cameras detected")
+        else:
+            refresh_role_labels()
+            root.after(100, update_thumbs)
+
+    for var in (left_var, right_var, front_var):
+        var.trace_add("write", refresh_role_labels)
+
+    # Open previews after the window is mapped (keeps UI responsive).
+    root.after(50, build_thumbs)
 
     checks = ttk.Frame(root)
     checks.pack(pady=4)
@@ -194,6 +386,7 @@ def selection_gui():
         return None if v == "None" else int(v)
 
     def start():
+        stop_previews()
         choice["left"] = parse(left_var.get())
         choice["right"] = parse(right_var.get())
         choice["front"] = parse(front_var.get())
@@ -205,8 +398,14 @@ def selection_gui():
         choice["mirror_front"] = mirror_front.get()
         root.destroy()
 
+    def on_close():
+        stop_previews()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     tk.Button(root, text="Start", command=start).pack(pady=10)
     root.mainloop()
+    stop_previews()
     return choice
 
 

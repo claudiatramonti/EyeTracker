@@ -1,10 +1,14 @@
 """
 Optional yaw/pitch scale refinement after center (C) calibration.
 
-Does NOT replace ArUco ray∩plane mapping. After R_gaze_to_cam is set, arrow-key
-samples compare measured cam gaze vs the direction that should hit each screen
-edge (from current ArUco R,t). Scales stretch/compress yaw/pitch before the
-existing geometric hit — head motion still comes from ArUco every frame.
+Pipeline (after C sets R_gaze_to_cam):
+  1. User looks at an edge cross on the full monitor window, presses matching arrow key.
+  2. GazeScreen3D collects ~12 raw gaze frames → record_edge_from_gaze_samples.
+  3. Compare measured cam gaze vs ArUco-expected direction to that edge pixel.
+  4. Store ratio → scale_x_left/right, scale_y_up/down (default 1.0).
+  5. Every frame: apply_yaw_pitch_scale in ray_screen before ray ∩ ArUco plane.
+
+Does NOT replace ArUco mapping. Head motion still comes from live R,t every frame.
 """
 
 from __future__ import annotations
@@ -16,9 +20,10 @@ import numpy as np
 
 from ray_screen import gaze_dir_in_cam, normalize
 
-MARGIN_PX = 80
-MIN_ANGLE_ABS = 0.02  # rad (~1.1°) — ignore near-zero samples
-SCALE_MIN = 0.45
+# --- Tuning constants ---
+MARGIN_PX = 80  # edge target inset from window border (px)
+MIN_ANGLE_ABS = 0.02  # rad (~1.1°); reject samples if gaze barely off-center
+SCALE_MIN = 0.45  # clamp edge scales (avoid runaway stretch)
 SCALE_MAX = 2.4
 
 EDGE_ORDER = ("top", "bottom", "left", "right")
@@ -32,7 +37,7 @@ EDGE_SHORT = {"top": "U", "bottom": "D", "left": "L", "right": "R"}
 
 
 def calibration_targets(width_px, height_px, margin=MARGIN_PX):
-    """Edge midpoints from current window size (not hardcoded absolutes)."""
+    """Pixel (u,v) for center + four edge midpoints; scales with window size."""
     w = max(int(width_px), 1)
     h = max(int(height_px), 1)
     m = int(np.clip(margin, 8, min(w, h) // 4))
@@ -47,7 +52,7 @@ def calibration_targets(width_px, height_px, margin=MARGIN_PX):
 
 
 def pixel_to_object_mm(u, v, width_px, height_px, width_mm, height_mm):
-    """OpenCV pixel (top-left) → screen object mm (Y up, origin center)."""
+    """OpenCV pixel (top-left origin) → point on screen plane in object mm (Y up, Z=0)."""
     x = (float(u) / max(width_px, 1) - 0.5) * width_mm
     y = (0.5 - float(v) / max(height_px, 1)) * height_mm
     return np.array([x, y, 0.0], dtype=np.float64)
@@ -55,8 +60,10 @@ def pixel_to_object_mm(u, v, width_px, height_px, width_mm, height_mm):
 
 def expected_cam_direction(u, v, rotation, translation, width_mm, height_mm, width_px, height_px):
     """
-    Unit direction from camera origin through the 3D screen point for pixel (u,v).
-    Uses live ArUco R,t — same geometry as gaze_to_screen.
+    Unit direction from camera origin through the 3D screen point for pixel (u, v).
+
+    Steps: pixel → object mm → camera frame via solvePnP R,t → normalize.
+    Same geometry as gaze_to_screen (inverse of the hit test).
     """
     if rotation is None or translation is None:
         return None
@@ -68,7 +75,7 @@ def expected_cam_direction(u, v, rotation, translation, width_mm, height_mm, wid
 
 
 def direction_to_yaw_pitch(direction):
-    """OpenCV cam frame (+Z forward, +Y down): yaw right+, pitch down+."""
+    """OpenCV camera frame (+Z forward, +Y down): yaw right+, pitch down+."""
     d = normalize(direction)
     if d is None:
         return None
@@ -78,9 +85,9 @@ def direction_to_yaw_pitch(direction):
 
 
 def yaw_pitch_to_direction(yaw, pitch):
+    """Rebuild unit direction from yaw/pitch (inverse of direction_to_yaw_pitch)."""
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
-    # yaw about Y, then pitch about X' — consistent with atan2 extraction above
     x = sy * cp
     y = sp
     z = cy * cp
@@ -96,7 +103,15 @@ def apply_yaw_pitch_scale(
     scale_y_up=None,
     scale_y_down=None,
 ):
-    """Stretch yaw/pitch of a cam-space unit direction. Identity if scales ~1."""
+    """
+    Stretch gaze yaw/pitch asymmetrically before ray ∩ screen plane.
+
+    Applied in ray_screen.gaze_dir_in_cam every frame when any scale != 1:
+      yaw < 0 (left)  x scale_x_left
+      yaw > 0 (right) x scale_x_right
+      pitch < 0 (up)  x scale_y_up   (OpenCV Y-down: negative pitch = up)
+      pitch > 0 (down)x scale_y_down
+    """
     if direction is None:
         return None
     sx_left = float(scale_x if scale_x_left is None else scale_x_left)
@@ -110,6 +125,7 @@ def apply_yaw_pitch_scale(
         and abs(sy_down - 1.0) < 1e-6
     ):
         return normalize(direction)
+
     angles = direction_to_yaw_pitch(direction)
     if angles is None:
         return normalize(direction)
@@ -132,7 +148,11 @@ def _clip_scale(value):
 
 
 def _angle_scale_ratio(measured, expected):
-    """|expected/measured| when signs agree; None if unusable."""
+    """
+    Edge scale from one angle sample: |expected / measured| when signs agree.
+
+    > 1 means measured angle was too small (gaze fell short of edge) --> stretch.
+  """
     if abs(measured) < MIN_ANGLE_ABS or abs(expected) < MIN_ANGLE_ABS:
         return None
     if measured * expected < 0.0:
@@ -141,20 +161,24 @@ def _angle_scale_ratio(measured, expected):
 
 
 class GazeScaleCalib:
-    """Collect edge samples → horizontal/vertical gaze scales (default 1,1)."""
+    """
+    Holds optional edge calibration state for GazeScreen3D.
+
+    One instance for the session; scales reset on new C (clear_edges) or E key.
+    """
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.samples = {}  # edge -> {yaw_m, pitch_m, yaw_e, pitch_e, u, v}
+        self.samples = {}  # edge name → {yaw_m, pitch_m, yaw_e, pitch_e, u, v}
         self.scale_x_left = 1.0
         self.scale_x_right = 1.0
         self.scale_y_up = 1.0
         self.scale_y_down = 1.0
 
     def clear_edges(self):
-        """Keep identity scales; drop edge samples (call after new C)."""
+        """Reset all four scales to 1 and drop samples (GazeScreen3D calls after C or E)."""
         self.samples.clear()
         self.scale_x_left = 1.0
         self.scale_x_right = 1.0
@@ -163,24 +187,24 @@ class GazeScaleCalib:
 
     @property
     def scale_x(self):
-        """Legacy single horizontal scale (mean of left/right)."""
+        """Legacy mean of left/right (e.g. old single-scale callers)."""
         return 0.5 * (self.scale_x_left + self.scale_x_right)
 
     @property
     def scale_y(self):
-        """Legacy single vertical scale (mean of up/down)."""
+        """Legacy mean of up/down."""
         return 0.5 * (self.scale_y_up + self.scale_y_down)
 
     def _clip_edge_scale(self, value):
         return float(np.clip(value, SCALE_MIN, SCALE_MAX))
 
     def nudge_horizontal(self, delta):
-        """Live fine-tune horizontal range (,/. keys)."""
+        """Manual tweak: ,/. keys shift scale_x_left and scale_x_right together."""
         self.scale_x_left = self._clip_edge_scale(self.scale_x_left + delta)
         self.scale_x_right = self._clip_edge_scale(self.scale_x_right + delta)
 
     def nudge_vertical(self, delta):
-        """Live fine-tune vertical range ([/] keys)."""
+        """Manual tweak: [/] keys shift scale_y_up and scale_y_down together."""
         self.scale_y_up = self._clip_edge_scale(self.scale_y_up + delta)
         self.scale_y_down = self._clip_edge_scale(self.scale_y_down + delta)
 
@@ -195,6 +219,7 @@ class GazeScaleCalib:
         )
 
     def status_line(self):
+        """HUD line: which edges sampled + current scale values."""
         done = "".join(EDGE_SHORT[e] for e in EDGE_ORDER if e in self.samples)
         pending = "".join(EDGE_SHORT[e] for e in EDGE_ORDER if e not in self.samples)
         scales = self.scales_summary()
@@ -205,6 +230,7 @@ class GazeScaleCalib:
         return f"Edges: {done or '-'} need {pending}  {scales}"
 
     def refit(self):
+        """Recompute all four scales from stored edge samples (called after each record_edge)."""
         left_ratios = []
         right_ratios = []
         up_ratios = []
@@ -248,6 +274,12 @@ class GazeScaleCalib:
         height_px,
         margin=MARGIN_PX,
     ):
+        """
+        One edge calibration sample (usually after averaging 12 gaze frames).
+
+        Compares IR gaze (after C, before edge scales) to ArUco-expected direction
+        for the edge pixel; updates self.samples and refits scales.
+        """
         if edge not in EDGE_ORDER:
             return False, f"Unknown edge {edge}"
         if gaze_dir_eye is None or R_gaze_to_cam is None:
@@ -258,7 +290,9 @@ class GazeScaleCalib:
         targets = calibration_targets(width_px, height_px, margin=margin)
         u, v = targets[edge]
 
+        # Measured: IR gaze → front-cam direction (no edge scales during calibration)
         measured = gaze_dir_in_cam(gaze_dir_eye, R_gaze_to_cam, opencv_y_down=True)
+        # Expected: ray from camera origin through edge pixel on ArUco screen plane
         expected = expected_cam_direction(
             u, v, rotation, translation, width_mm, height_mm, width_px, height_px
         )
@@ -273,6 +307,7 @@ class GazeScaleCalib:
         yaw_m, pitch_m = m_angles
         yaw_e, pitch_e = e_angles
 
+        # Reject if user did not look far enough toward that edge
         if edge in ("left", "right") and abs(yaw_m) < MIN_ANGLE_ABS:
             return False, f"{edge}: look farther toward the {edge} edge"
         if edge in ("top", "bottom") and abs(pitch_m) < MIN_ANGLE_ABS:
@@ -295,7 +330,7 @@ class GazeScaleCalib:
 
 
 def average_unit_vectors(vectors):
-    """Mean of unit 3D directions, re-normalized."""
+    """Fuse multiple per-frame gaze directions: sum unit vectors, re-normalize."""
     valid = [np.asarray(v, dtype=np.float64).reshape(3) for v in vectors if v is not None]
     if not valid:
         return None
@@ -315,7 +350,9 @@ def record_edge_from_gaze_samples(
     width_px,
     height_px,
 ):
-    """Average several gaze frames, then run edge calibration once."""
+    """
+    GazeScreen3D edge capture: average EDGE_CALIB_FRAMES raw gaze vectors, then record_edge once.
+    """
     gaze_dir = average_unit_vectors(gaze_samples)
     if gaze_dir is None:
         return False, f"{edge}: no gaze samples"
@@ -333,7 +370,7 @@ def record_edge_from_gaze_samples(
 
 
 def draw_edge_targets(canvas, width_px, height_px, done_edges, margin=MARGIN_PX):
-    """Small crosses at edge targets; green if sampled, yellow if pending."""
+    """Edge crosses on heatmap: yellow = pending, green = already sampled."""
     targets = calibration_targets(width_px, height_px, margin=margin)
     for edge in EDGE_ORDER:
         u, v = targets[edge]
@@ -355,10 +392,10 @@ def draw_edge_targets(canvas, width_px, height_px, done_edges, margin=MARGIN_PX)
 
 def draw_center_calib_target(canvas, width_px, height_px, margin=MARGIN_PX):
     """
-    Large marker at the physical monitor center — look HERE for C calibration.
+    Cyan cross at monitor center — look HERE and press C.
 
-    Not the front-camera PiP: C aligns gaze to camera forward while you look at
-    the real screen center (same point used by ArUco mm frame origin).
+    Full-window overlay only. NOT the Front PiP, NOT the purple ArUco cross
+    in the front-camera preview (that is debug pose, not the C target).
     """
     targets = calibration_targets(width_px, height_px, margin=margin)
     cx = int(round(targets["center"][0]))
@@ -389,7 +426,7 @@ def draw_center_calib_target(canvas, width_px, height_px, margin=MARGIN_PX):
 
 
 def draw_front_preview_not_for_c(canvas, x, y, w, h):
-    """Reminder on the front PiP — C uses physical screen center, not this window."""
+    """Orange border on Front PiP: reminds user not to use it for C calibration."""
     if w < 40 or h < 30:
         return
     cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 140, 255), 2)
